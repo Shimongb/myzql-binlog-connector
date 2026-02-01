@@ -1,0 +1,18 @@
+{
+  "host": "127.0.0.1",
+  "port": 3306,
+  "user": "repl_user",
+  "password": "",
+  "database": "mysql",
+  "from_binlog_file": "binlog.000001",
+  "from_binlog_position": 4,
+  "to_binlog_file": "binlog.000002",
+  "to_binlog_position": 12345678,
+  "exclude": [
+    "excluded_schema.*",
+    "*.excluded_table"
+  ],
+  "output_mode": "parquet",
+  "parquet_output_dir": "./parquet_output",
+  "parquet_batch_size": 8192
+}
