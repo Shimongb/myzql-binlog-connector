@@ -11,7 +11,7 @@ const PacketWriter = @import("packet_writer.zig").PacketWriter;
 
 pub const HandshakeResponse41 = struct {
     client_flag: u32, // capabilities
-    max_packet_size: u32 = 0, // TODO: support configurable max packet size
+    max_packet_size: u32 = 1 << 24, // 16 MiB (standard MySQL client default)
     character_set: u8,
     username: [:0]const u8,
     auth_response: []const u8,
@@ -20,10 +20,10 @@ pub const HandshakeResponse41 = struct {
     key_values: []const [2][]const u8 = &.{},
     zstd_compression_level: u8 = 0,
 
-    pub fn init(comptime auth_plugin: AuthPlugin, config: *const Config, auth_resp: []const u8) HandshakeResponse41 {
+    pub fn init(comptime auth_plugin: AuthPlugin, config: *const Config, capabilities: u32, auth_resp: []const u8) HandshakeResponse41 {
         return .{
             .database = config.database,
-            .client_flag = config.capability_flags(),
+            .client_flag = capabilities,
             .character_set = config.collation,
             .username = config.username,
             .auth_response = auth_resp,

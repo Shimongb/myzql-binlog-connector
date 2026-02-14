@@ -1,11 +1,15 @@
 // MySQL connection handler (trimmed to used code paths only).
 // Originally from myzql library (MIT License, Copyright (c) 2023 Zack).
 const std = @import("std");
+const builtin = @import("builtin");
+const tls = std.crypto.tls;
 
 const auth = @import("auth.zig");
+const AuthPlugin = auth.AuthPlugin;
 const Config = @import("config.zig").Config;
 const compat = @import("compat.zig");
 const constants = @import("constants.zig");
+const SocketIo = @import("socket_io.zig").SocketIo;
 const HandshakeV10 = @import("protocol/handshake_v10.zig").HandshakeV10;
 const ErrorPacket = @import("protocol/generic_response.zig").ErrorPacket;
 const OkPacket = @import("protocol/generic_response.zig").OkPacket;
@@ -28,6 +32,14 @@ pub const Conn = struct {
     // Buffer to store metadata of the result set
     result_meta: ResultMeta,
 
+    // TLS resources (heap-allocated, null when not using TLS)
+    socket_io: ?*SocketIo = null,
+    tls_client: ?*tls.Client = null,
+    tls_read_buf: ?[]u8 = null,
+    tls_write_buf: ?[]u8 = null,
+    tls_app_read_buf: ?[]u8 = null,
+    tls_app_write_buf: ?[]u8 = null,
+
     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !Conn {
         var conn: Conn = blk: {
@@ -45,7 +57,9 @@ pub const Conn = struct {
         };
         errdefer conn.deinit(allocator);
 
-        const auth_plugin, const auth_data = blk: {
+        var auth_plugin: AuthPlugin = undefined;
+        var auth_data: [20]u8 = undefined;
+        {
             const packet = try conn.readPacket();
             const handshake_v10 = switch (packet.payload[0]) {
                 constants.HANDSHAKE_V10 => HandshakeV10.init(&packet),
@@ -59,21 +73,337 @@ pub const Conn = struct {
                 return error.UnsupportedProtocol;
             }
 
-            break :blk .{ handshake_v10.get_auth_plugin(), handshake_v10.get_auth_data() };
+            auth_plugin = handshake_v10.get_auth_plugin();
+            auth_data = handshake_v10.get_auth_data();
+
+            std.log.debug("capabilities: server=0x{x:0>8} client=0x{x:0>8} negotiated=0x{x:0>8}", .{
+                handshake_v10.capability_flags(),
+                config.capability_flags(),
+                conn.capabilities,
+            });
+        }
+
+        // TLS upgrade: after handshake, before auth
+        if (config.ssl and (conn.capabilities & constants.CLIENT_SSL != 0)) {
+            try conn.upgradeTLS(allocator, config);
+        }
+
+        // Send initial auth using the server's advertised plugin.
+        std.log.info("using auth plugin: {any}", .{auth_plugin});
+        try conn.sendAuth(auth_plugin, &auth_data, config);
+
+        // Read auth response — may be OK, Error, or AuthSwitch.
+        // std.log.err("TRACE: about to readPacket for auth response", .{});
+        const packet = try conn.readPacket();
+        // std.log.err("TRACE: auth response received, first_byte=0x{x:0>2} len={d}", .{ packet.payload[0], packet.payload.len });
+        // std.log.debug("auth response: first_byte=0x{x:0>2} len={d} seq={d} raw={any}", .{
+        //     packet.payload[0],
+        //     packet.payload.len,
+        //     packet.sequence_id,
+        //     packet.payload[0..@min(packet.payload.len, 40)],
+        // });
+        switch (packet.payload[0]) {
+            constants.OK => return conn,
+            constants.ERR => return ErrorPacket.init(&packet).asError(),
+            constants.AUTH_MORE_DATA => {
+                // caching_sha2_password multi-round exchange after initial auth.
+                const more_data = packet.payload[1..];
+                switch (more_data[0]) {
+                    auth.caching_sha2_password_fast_auth_success => {
+                        // Fast auth succeeded – server will send OK next.
+                        const ok_pkt = try conn.readPacket();
+                        return switch (ok_pkt.payload[0]) {
+                            constants.OK => conn,
+                            constants.ERR => ErrorPacket.init(&ok_pkt).asError(),
+                            else => ok_pkt.asError(),
+                        };
+                    },
+                    auth.caching_sha2_password_full_authentication_start => {
+                        // Full auth required.  Over TLS send cleartext password.
+                        if (conn.stream.tls_reader != null) {
+                            const pw = config.password;
+                            var pw_buf: [256]u8 = undefined;
+                            @memcpy(pw_buf[0..pw.len], pw);
+                            pw_buf[pw.len] = 0;
+                            try conn.writeBytesAsPacket(pw_buf[0 .. pw.len + 1]);
+                            try conn.writer.flush();
+                        } else {
+                            return error.FullAuthRequiredWithoutTLS;
+                        }
+                        const ok_pkt = try conn.readPacket();
+                        return switch (ok_pkt.payload[0]) {
+                            constants.OK => conn,
+                            constants.ERR => ErrorPacket.init(&ok_pkt).asError(),
+                            else => ok_pkt.asError(),
+                        };
+                    },
+                    else => return error.UnsupportedCachingSha2PasswordMoreData,
+                }
+            },
+            constants.AUTH_SWITCH => {
+                // Parse auth switch: 0xFE + plugin_name\0 + auth_data
+                const rest = packet.payload[1..];
+                const null_idx = std.mem.indexOfScalar(u8, rest, 0) orelse return error.UnexpectedPacket;
+                const new_plugin_name = rest[0..null_idx];
+                const new_plugin = AuthPlugin.fromName(new_plugin_name);
+                std.log.info("auth switch to: {s}", .{new_plugin_name});
+
+                // New auth data follows the null terminator (20 bytes for most plugins).
+                const new_auth_data_raw = rest[null_idx + 1 ..];
+                if (new_auth_data_raw.len >= 20) {
+                    @memcpy(&auth_data, new_auth_data_raw[0..20]);
+                } else if (new_auth_data_raw.len > 0) {
+                    @memset(&auth_data, 0);
+                    @memcpy(auth_data[0..new_auth_data_raw.len], new_auth_data_raw);
+                }
+
+                // Respond to auth switch
+                try conn.handleAuthSwitch(allocator, new_plugin, &auth_data, config);
+                return conn;
+            },
+            else => return packet.asError(),
+        }
+    }
+
+    /// Send the initial HandshakeResponse41 with auth data for the given plugin.
+    fn sendAuth(c: *Conn, plugin: AuthPlugin, auth_data: *const [20]u8, config: *const Config) !void {
+        // Compute auth response based on plugin type
+        var native_resp: [20]u8 = undefined;
+        var sha256_resp: [32]u8 = undefined;
+        const auth_resp_data: []const u8 = switch (plugin) {
+            .mysql_native_password => blk: {
+                if (config.password.len == 0) break :blk &[_]u8{};
+                native_resp = auth.scramblePassword(auth_data, config.password);
+                break :blk &native_resp;
+            },
+            .caching_sha2_password => blk: {
+                if (config.password.len == 0) break :blk &[_]u8{};
+                sha256_resp = auth.scrambleSHA256Password(auth_data, config.password);
+                break :blk &sha256_resp;
+            },
+            .sha256_password => &[_]u8{auth.sha256_password_public_key_request},
+            else => return error.UnsupportedAuthPlugin,
         };
 
-        // more auth exchange based on auth_method
-        switch (auth_plugin) {
-            .caching_sha2_password => try conn.auth_caching_sha2_password(allocator, &auth_data, config),
-            .mysql_native_password => try conn.auth_mysql_native_password(&auth_data, config),
-            .sha256_password => try conn.auth_sha256_password(allocator, &auth_data, config),
+        // Get plugin name as null-terminated string
+        const plugin_name: [:0]const u8 = switch (plugin) {
+            .mysql_native_password => "mysql_native_password",
+            .caching_sha2_password => "caching_sha2_password",
+            .sha256_password => "sha256_password",
+            else => return error.UnsupportedAuthPlugin,
+        };
+
+        const response: HandshakeResponse41 = .{
+            .database = config.database,
+            .client_flag = c.capabilities,
+            .character_set = config.collation,
+            .username = config.username,
+            .auth_response = auth_resp_data,
+            .client_plugin_name = plugin_name,
+        };
+        try c.writePacket(response);
+        try c.writer.flush();
+    }
+
+    /// Handle auth switch: re-authenticate with the new plugin, then read OK/Error.
+    fn handleAuthSwitch(c: *Conn, allocator: std.mem.Allocator, plugin: AuthPlugin, auth_data: *const [20]u8, config: *const Config) !void {
+        switch (plugin) {
+            .mysql_native_password => {
+                const resp = if (config.password.len > 0) &auth.scramblePassword(auth_data, config.password) else &[_]u8{};
+                try c.writeBytesAsPacket(resp);
+                try c.writer.flush();
+                const pkt = try c.readPacket();
+                return switch (pkt.payload[0]) {
+                    constants.OK => {},
+                    constants.ERR => ErrorPacket.init(&pkt).asError(),
+                    else => pkt.asError(),
+                };
+            },
+            .caching_sha2_password => {
+                // Send scrambled password
+                const resp = if (config.password.len > 0) &auth.scrambleSHA256Password(auth_data, config.password) else &[_]u8{};
+                try c.writeBytesAsPacket(resp);
+                try c.writer.flush();
+
+                // Process caching_sha2 multi-round exchange
+                while (true) {
+                    const pkt = try c.readPacket();
+                    switch (pkt.payload[0]) {
+                        constants.OK => return,
+                        constants.ERR => return ErrorPacket.init(&pkt).asError(),
+                        constants.AUTH_MORE_DATA => {
+                            const more_data = pkt.payload[1..];
+                            switch (more_data[0]) {
+                                auth.caching_sha2_password_fast_auth_success => {},
+                                auth.caching_sha2_password_full_authentication_start => {
+                                    // Over TLS we can send the password in cleartext.
+                                    // Append a null terminator as MySQL expects.
+                                    const pw = config.password;
+                                    var pw_buf: [256]u8 = undefined;
+                                    if (pw.len < pw_buf.len) {
+                                        @memcpy(pw_buf[0..pw.len], pw);
+                                        pw_buf[pw.len] = 0;
+                                        try c.writeBytesAsPacket(pw_buf[0 .. pw.len + 1]);
+                                        try c.writer.flush();
+                                    } else {
+                                        // Fallback: request public key and encrypt
+                                        try c.writeBytesAsPacket(&[_]u8{auth.caching_sha2_password_public_key_request});
+                                        try c.writer.flush();
+                                        const pk_pkt = try c.readPacket();
+                                        const decoded_pk = try auth.decodePublicKey(pk_pkt.payload, allocator);
+                                        defer decoded_pk.deinit(allocator);
+                                        const enc_pw = try auth.encryptPassword(allocator, config.password, auth_data, &decoded_pk.value);
+                                        defer allocator.free(enc_pw);
+                                        try c.writeBytesAsPacket(enc_pw);
+                                        try c.writer.flush();
+                                    }
+                                },
+                                else => return error.UnsupportedCachingSha2PasswordMoreData,
+                            }
+                        },
+                        else => return pkt.asError(),
+                    }
+                }
+            },
+            .sha256_password => {
+                try c.writeBytesAsPacket(&[_]u8{auth.sha256_password_public_key_request});
+                try c.writer.flush();
+                const pk_pkt = try c.readPacket();
+                const decoded_pk = try auth.decodePublicKey(pk_pkt.payload, allocator);
+                defer decoded_pk.deinit(allocator);
+                const enc_pw = try auth.encryptPassword(allocator, config.password, auth_data, &decoded_pk.value);
+                defer allocator.free(enc_pw);
+                try c.writeBytesAsPacket(enc_pw);
+                try c.writer.flush();
+                const pkt = try c.readPacket();
+                return switch (pkt.payload[0]) {
+                    constants.OK => {},
+                    constants.ERR => ErrorPacket.init(&pkt).asError(),
+                    else => pkt.asError(),
+                };
+            },
             else => {
-                std.log.warn("Unsupported auth plugin: {any}\n", .{auth_plugin});
+                std.log.err("unsupported auth switch plugin: {any}", .{plugin});
                 return error.UnsupportedAuthPlugin;
             },
         }
+    }
 
-        return conn;
+    /// Send SSL Request packet, perform TLS handshake using Zig std.crypto.tls,
+    /// and switch stream to TLS.
+    fn upgradeTLS(conn: *Conn, allocator: std.mem.Allocator, config: *const Config) !void {
+        // Step 1: Send SSL Request packet (capabilities + max_packet_size + charset + 23 fillers)
+        // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html
+        // Must use negotiated capabilities (same as HandshakeResponse41) per MySQL protocol spec.
+        var ssl_request: [32]u8 = undefined;
+        const cap_flags = conn.capabilities;
+        std.mem.writeInt(u32, ssl_request[0..4], cap_flags, .little);
+        std.mem.writeInt(u32, ssl_request[4..8], 1 << 24, .little); // max_packet_size (16 MiB)
+        ssl_request[8] = config.collation; // character_set
+        @memset(ssl_request[9..32], 0); // 23 bytes filler
+        try conn.writeBytesAsPacket(&ssl_request);
+        try conn.writer.flush();
+
+        // Step 2: Allocate TLS resources
+        const buf_len = tls.Client.min_buffer_len;
+
+        const socket_io = try allocator.create(SocketIo);
+        errdefer allocator.destroy(socket_io);
+
+        const tls_read_buf = try allocator.alloc(u8, buf_len);
+        errdefer allocator.free(tls_read_buf);
+
+        const tls_write_buf = try allocator.alloc(u8, buf_len);
+        errdefer allocator.free(tls_write_buf);
+
+        const tls_app_read_buf = try allocator.alloc(u8, buf_len);
+        errdefer allocator.free(tls_app_read_buf);
+
+        const tls_app_write_buf = try allocator.alloc(u8, buf_len);
+        errdefer allocator.free(tls_app_write_buf);
+
+        // Initialize the socket I/O bridge (raw fd -> Io.Reader/Writer vtables)
+        socket_io.init(conn.stream.handle, tls_read_buf, tls_write_buf);
+
+        // Step 3: Generate entropy
+        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+        fillRandomBytes(&entropy);
+
+        // Step 4: Perform TLS handshake
+        var tls_alert: tls.Alert = undefined;
+        const tls_client_val = tls.Client.init(
+            &socket_io.reader_iface,
+            &socket_io.writer_iface,
+            .{
+                .host = .no_verification,
+                .ca = .no_verification,
+                .read_buffer = tls_app_read_buf,
+                .write_buffer = tls_app_write_buf,
+                .entropy = &entropy,
+                .realtime_now_seconds = realtimeSeconds(),
+                .allow_truncation_attacks = true,
+                .alert = &tls_alert,
+            },
+        ) catch |err| {
+            std.log.err("TLS handshake failed: {} alert={any}", .{ err, tls_alert });
+            return error.TlsHandshakeFailed;
+        };
+
+        // Step 5: Heap-allocate the TLS Client (must not move — uses @fieldParentPtr internally)
+        const tls_client = try allocator.create(tls.Client);
+        errdefer allocator.destroy(tls_client);
+        tls_client.* = tls_client_val;
+
+        // Step 6: Switch stream to use TLS
+        conn.stream.tls_reader = &tls_client.reader;
+        conn.stream.tls_writer = &tls_client.writer;
+        conn.stream.tls_underlying_writer = &socket_io.writer_iface;
+
+        // Step 7: Update reader/writer (they store stream by value)
+        conn.reader.stream = conn.stream;
+        conn.writer.stream = conn.stream;
+
+        // Step 8: Store TLS resources for cleanup
+        conn.socket_io = socket_io;
+        conn.tls_client = tls_client;
+        conn.tls_read_buf = tls_read_buf;
+        conn.tls_write_buf = tls_write_buf;
+        conn.tls_app_read_buf = tls_app_read_buf;
+        conn.tls_app_write_buf = tls_app_write_buf;
+
+        std.log.info("TLS connection established", .{});
+    }
+
+    fn realtimeSeconds() i64 {
+        if (comptime builtin.os.tag == .linux) {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+            return ts.sec;
+        } else {
+            // macOS / BSD
+            var tv: std.c.timeval = undefined;
+            _ = std.c.gettimeofday(&tv, null);
+            return tv.sec;
+        }
+    }
+
+    fn fillRandomBytes(buf: []u8) void {
+        if (comptime builtin.os.tag == .linux) {
+            var filled: usize = 0;
+            while (filled < buf.len) {
+                const rc = std.os.linux.getrandom(buf[filled..].ptr, buf.len - filled, 0);
+                const errno = std.posix.errno(rc);
+                if (errno == .SUCCESS) {
+                    filled += rc;
+                } else if (errno == .INTR) {
+                    continue;
+                } else {
+                    @panic("getrandom failed");
+                }
+            }
+        } else {
+            std.c.arc4random_buf(buf.ptr, buf.len);
+        }
     }
 
     pub fn deinit(c: *Conn, allocator: std.mem.Allocator) void {
@@ -82,6 +412,14 @@ pub const Conn = struct {
         c.reader.deinit();
         c.writer.deinit();
         c.result_meta.deinit(allocator);
+
+        // Free TLS resources
+        if (c.tls_client) |tc| allocator.destroy(tc);
+        if (c.socket_io) |sio| allocator.destroy(sio);
+        if (c.tls_read_buf) |buf| allocator.free(buf);
+        if (c.tls_write_buf) |buf| allocator.free(buf);
+        if (c.tls_app_read_buf) |buf| allocator.free(buf);
+        if (c.tls_app_write_buf) |buf| allocator.free(buf);
     }
 
     pub fn ping(c: *Conn) !void {
@@ -118,81 +456,6 @@ pub const Conn = struct {
             else => return err,
         };
         return packet.asError();
-    }
-
-    fn auth_mysql_native_password(c: *Conn, auth_data: *const [20]u8, config: *const Config) !void {
-        const auth_resp = auth.scramblePassword(auth_data, config.password);
-        const response = HandshakeResponse41.init(.mysql_native_password, config, if (config.password.len > 0) &auth_resp else &[_]u8{});
-        try c.writePacket(response);
-        try c.writer.flush();
-
-        const packet = try c.readPacket();
-        return switch (packet.payload[0]) {
-            constants.OK => {},
-            else => packet.asError(),
-        };
-    }
-
-    fn auth_sha256_password(c: *Conn, allocator: std.mem.Allocator, auth_data: *const [20]u8, config: *const Config) !void {
-        const response = HandshakeResponse41.init(.sha256_password, config, &[_]u8{auth.sha256_password_public_key_request});
-        try c.writePacket(response);
-        try c.writer.flush();
-
-        const pk_packet = try c.readPacket();
-
-        // Decode public key
-        const decoded_pk = try auth.decodePublicKey(pk_packet.payload, allocator);
-        defer decoded_pk.deinit(allocator);
-
-        const enc_pw = try auth.encryptPassword(allocator, config.password, auth_data, &decoded_pk.value);
-        defer allocator.free(enc_pw);
-
-        try c.writeBytesAsPacket(enc_pw);
-        try c.writer.flush();
-
-        const resp_packet = try c.readPacket();
-        return switch (resp_packet.payload[0]) {
-            constants.OK => {},
-            else => resp_packet.asError(),
-        };
-    }
-
-    fn auth_caching_sha2_password(c: *Conn, allocator: std.mem.Allocator, auth_data: *const [20]u8, config: *const Config) !void {
-        const auth_resp = auth.scrambleSHA256Password(auth_data, config.password);
-        const response = HandshakeResponse41.init(.caching_sha2_password, config, &auth_resp);
-        try c.writePacket(&response);
-        try c.writer.flush();
-
-        while (true) {
-            const packet = try c.readPacket();
-            switch (packet.payload[0]) {
-                constants.OK => return,
-                constants.AUTH_MORE_DATA => {
-                    const more_data = packet.payload[1..];
-                    switch (more_data[0]) {
-                        auth.caching_sha2_password_fast_auth_success => {}, // success (do nothing, wait for next packet)
-                        auth.caching_sha2_password_full_authentication_start => {
-                            try c.writeBytesAsPacket(&[_]u8{auth.caching_sha2_password_public_key_request});
-                            try c.writer.flush();
-                            const pk_packet = try c.readPacket();
-
-                            // Decode public key
-                            const decoded_pk = try auth.decodePublicKey(pk_packet.payload, allocator);
-                            defer decoded_pk.deinit(allocator);
-
-                            // Encrypt password
-                            const enc_pw = try auth.encryptPassword(allocator, config.password, auth_data, &decoded_pk.value);
-                            defer allocator.free(enc_pw);
-
-                            try c.writeBytesAsPacket(enc_pw);
-                            try c.writer.flush();
-                        },
-                        else => return error.UnsupportedCachingSha2PasswordMoreData,
-                    }
-                },
-                else => return packet.asError(),
-            }
-        }
     }
 
     pub inline fn readPacket(c: *Conn) !Packet {

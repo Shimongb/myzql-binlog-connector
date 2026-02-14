@@ -49,6 +49,15 @@ pub const HandshakeV10 = struct {
             handshake_v10.auth_plugin_name = null;
         }
 
+        std.log.debug("handshake: server_version={s} conn_id={d} auth_plugin_name={s} auth_data_len={?d} cap_flags=0x{x:0>8} part2_len={d}", .{
+            handshake_v10.server_version,
+            handshake_v10.connection_id,
+            handshake_v10.auth_plugin_name orelse "(null)",
+            handshake_v10.auth_plugin_data_len,
+            handshake_v10.capability_flags(),
+            handshake_v10.auth_plugin_data_part_2.len,
+        });
+
         std.debug.assert(reader.finished());
         return handshake_v10;
     }

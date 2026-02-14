@@ -164,20 +164,69 @@ pub const RowJsonSerializer = struct {
         }
     }
 
+    /// Write a JSON-escaped string, ensuring valid UTF-8 output.
+    /// Valid UTF-8 multi-byte sequences are passed through; invalid bytes are
+    /// escaped as \u00XX to prevent producing invalid UTF-8 in the output.
     fn writeJsonString(writer: anytype, str: []const u8) !void {
         try writer.writeByte('"');
-        for (str) |c| {
+        var i: usize = 0;
+        while (i < str.len) {
+            const c = str[i];
             switch (c) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                '\n' => try writer.writeAll("\\n"),
-                '\r' => try writer.writeAll("\\r"),
-                '\t' => try writer.writeAll("\\t"),
+                '"' => {
+                    try writer.writeAll("\\\"");
+                    i += 1;
+                },
+                '\\' => {
+                    try writer.writeAll("\\\\");
+                    i += 1;
+                },
+                '\n' => {
+                    try writer.writeAll("\\n");
+                    i += 1;
+                },
+                '\r' => {
+                    try writer.writeAll("\\r");
+                    i += 1;
+                },
+                '\t' => {
+                    try writer.writeAll("\\t");
+                    i += 1;
+                },
                 else => {
                     if (c < 0x20) {
-                        try writer.print("\\u{x:0>4}", .{c});
-                    } else {
+                        try writer.print("\\u{x:0>4}", .{@as(u16, c)});
+                        i += 1;
+                    } else if (c < 0x80) {
+                        // ASCII printable
                         try writer.writeByte(c);
+                        i += 1;
+                    } else {
+                        // Determine expected UTF-8 sequence length from start byte
+                        const seq_len: usize = if (c >= 0xF0 and c <= 0xF4) 4 //
+                        else if (c >= 0xE0) 3 //
+                        else if (c >= 0xC2) 2 //
+                        else 0; // 0x80-0xBF (continuation) or 0xC0-0xC1 (overlong)
+
+                        if (seq_len >= 2 and i + seq_len <= str.len) {
+                            // Validate continuation bytes (must be 0x80-0xBF)
+                            var valid = true;
+                            for (1..seq_len) |j| {
+                                if ((str[i + j] & 0xC0) != 0x80) {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if (valid) {
+                                // Valid UTF-8 sequence, pass through
+                                try writer.writeAll(str[i .. i + seq_len]);
+                                i += seq_len;
+                                continue;
+                            }
+                        }
+                        // Invalid or truncated UTF-8: escape individual byte
+                        try writer.print("\\u00{x:0>2}", .{c});
+                        i += 1;
                     }
                 },
             }
