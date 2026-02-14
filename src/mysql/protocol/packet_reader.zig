@@ -45,7 +45,7 @@ pub const PacketReader = struct {
 
         // Packet header
         const payload_length = std.mem.readInt(u24, p.buf[p.pos..][0..3], .little);
-        const sequence_id = p.buf[3];
+        const sequence_id = p.buf[p.pos + 3];
         p.pos += 4;
 
         { // read more bytes from network if required
@@ -67,7 +67,9 @@ pub const PacketReader = struct {
 
     fn readToBufferAtLeast(p: *PacketReader, at_least: usize) !void {
         try p.expandBufIfNeeded(at_least);
+        // std.log.err("TRACE: readToBufferAtLeast at_least={d} buf_avail={d}", .{ at_least, p.buf.len - p.len });
         const n = try p.stream.readAtLeast(p.buf[p.len..], at_least);
+        // std.log.err("TRACE: readToBufferAtLeast got n={d}", .{n});
         if (n == 0) {
             return error.UnexpectedEndOfStream;
         }

@@ -1,0 +1,18 @@
+{
+  "host": "127.0.0.1",
+  "port": 3306,
+  "user": "root",
+  "password": "",
+  "database": "mysql",
+  "from_binlog_file": "binlog.000002",
+  "from_binlog_position": 3758408,
+  "to_binlog_file": "binlog.000003",
+  "to_binlog_position": 23576589,
+  "exclude": [
+    "test_db_to_exclude.*",
+    "*.test_table_to_exclude"
+  ],
+  "output_mode": "parquet",
+  "parquet_output_dir": "./parquet_output",
+  "parquet_batch_size": 8192
+}

@@ -474,26 +474,24 @@ const DataReader = struct {
 
     /// Read BIT value from binlog
     ///
-    /// CRITICAL FIX: This function resolves the BIT column parsing bug that was causing
-    /// DECIMAL corruption. Previously, BIT columns incorrectly used readBlob() which
-    /// treated the metadata as a length prefix, reading far more bytes than needed.
+    /// BIT Metadata (2 bytes, little-endian):
+    ///   byte0 = bit_length % 8  (bits in the last partial byte)
+    ///   byte1 = bit_length / 8  (number of full bytes)
     ///
-    /// BIT Metadata Format: ((bits_in_last_byte) << 8) | total_bytes
+    /// As u16 LE: column_meta = (full_bytes << 8) | bits_in_last_byte
+    ///
+    /// Total storage bytes = full_bytes + (1 if bits_in_last_byte > 0 else 0)
+    ///
     /// Examples:
-    /// - BIT(1)  = 0x0001 → 1 byte total, 1 bit in last byte
-    /// - BIT(7)  = 0x0701 → 1 byte total, 7 bits in last byte
-    /// - BIT(9)  = 0x0102 → 2 bytes total, 1 bit in last byte
-    /// - BIT(16) = 0x0002 → 2 bytes total, 0 bits in last byte (evenly divisible by 8)
-    ///
-    /// The lower 8 bits (column_meta & 0xFF) indicate the total byte count.
-    /// The upper 8 bits indicate how many bits are used in the last byte.
-    ///
-    /// This fix ensures that BIT(1) reads exactly 1 byte instead of incorrectly
-    /// reading the first byte as a length and then reading N more bytes, which
-    /// corrupted all subsequent column offsets (especially visible in DECIMAL columns).
+    /// - BIT(1):  meta=[1,0] → 0x0001 → full=0, partial=1 → 1 byte
+    /// - BIT(7):  meta=[7,0] → 0x0007 → full=0, partial=7 → 1 byte
+    /// - BIT(8):  meta=[0,1] → 0x0100 → full=1, partial=0 → 1 byte
+    /// - BIT(9):  meta=[1,1] → 0x0101 → full=1, partial=1 → 2 bytes
+    /// - BIT(16): meta=[0,2] → 0x0200 → full=2, partial=0 → 2 bytes
     fn readBit(self: *DataReader, column_meta: u16) []const u8 {
-        // Extract total bytes from metadata (lower 8 bits)
-        const total_bytes = column_meta & 0xFF;
+        const bits_in_last_byte = column_meta & 0xFF;
+        const full_bytes = column_meta >> 8;
+        const total_bytes: usize = full_bytes + @as(usize, if (bits_in_last_byte > 0) 1 else 0);
 
         if (total_bytes == 0) {
             return &.{};
@@ -926,13 +924,33 @@ fn parseColumnValue(allocator: std.mem.Allocator, reader: *DataReader, col_type:
         //
         // STRING type (CHAR/BINARY/ENUM/SET)
         // Reference: Field_string::unpack() in sql/field.cc:6237-6267
-        // CHAR columns have a length prefix followed by actual data
+        // ENUM and SET are stored with type STRING in binlog; decode metadata to detect them.
         .MYSQL_TYPE_STRING => blk: {
-            // Decode metadata to get the declared field_length (max bytes)
+            // Decode metadata to get the real column type and field_length
             const parsed = parseStringColumnMeta(col_meta, @intFromEnum(ColumnType.MYSQL_TYPE_STRING));
+            const real_type: ColumnType = @enumFromInt(parsed.real_type);
             const field_length = parsed.length;
 
-            // Read length prefix: 1 byte if field_length <= 255, else 2 bytes
+            // Handle ENUM sub-type: stored as 1 or 2 byte index
+            if (real_type == .MYSQL_TYPE_ENUM) {
+                const val: u16 = if (field_length == 1)
+                    reader.readByte()
+                else
+                    reader.readInt(u16);
+                break :blk .{ .short = @intCast(val) };
+            }
+
+            // Handle SET sub-type: stored as N bytes (1-8)
+            if (real_type == .MYSQL_TYPE_SET) {
+                var val: u64 = 0;
+                var j: usize = 0;
+                while (j < field_length) : (j += 1) {
+                    val |= @as(u64, reader.readByte()) << @intCast(j * 8);
+                }
+                break :blk .{ .longlong = @intCast(val) };
+            }
+
+            // Regular CHAR/BINARY: length prefix followed by data
             const actual_length: usize = if (field_length > 255)
                 reader.readInt(u16) // 2-byte length prefix (little-endian)
             else

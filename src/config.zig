@@ -119,6 +119,9 @@ pub const Config = struct {
     include: ?[]const []const u8 = null,
     exclude: ?[]const []const u8 = null,
 
+    // === SSL/TLS Settings ===
+    ssl: bool = true,
+
     // === Logging Settings ===
     log_level: LogLevel = .info,
     log_file: ?[]const u8 = null,

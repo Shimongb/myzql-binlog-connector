@@ -150,6 +150,7 @@ pub fn main(init: std.process.Init) !void {
         config.user,
         config.password,
         config.database,
+        config.ssl,
     ) catch |err| {
         log.err("connection failed: {}", .{err});
         log.err("troubleshooting: verify MySQL is running at {s}:{d}, check credentials and firewall", .{ config.host, config.port });

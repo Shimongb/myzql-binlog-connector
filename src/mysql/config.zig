@@ -15,7 +15,7 @@ pub const Config = struct {
 
     // cfgs from Golang driver
     client_found_rows: bool = false, // Return number of matching rows instead of rows changed
-    ssl: bool = false,
+    ssl: bool = true,
     multi_statements: bool = false,
 
     pub fn capability_flags(config: *const Config) u32 {

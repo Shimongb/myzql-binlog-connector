@@ -279,12 +279,20 @@ pub const Pipeline = struct {
 
                     const start = metrics.nanoTimestamp();
 
-                    // Serialize before/after values to JSON
+                    // Serialize before/after values to JSON.
+                    // IMPORTANT: serialize() returns a slice into an internal reusable buffer,
+                    // so we must copy before_json before calling serialize() again for after_json,
+                    // otherwise before_json becomes a dangling reference to overwritten memory.
                     var before_json: ?[]const u8 = null;
+                    var before_json_copy: ?[]u8 = null;
                     var after_json: ?[]const u8 = null;
+                    defer if (before_json_copy) |b| self.allocator.free(b);
 
                     if (row_data.before_values) |vals| {
-                        before_json = serializer.serialize(vals) catch null;
+                        if (serializer.serialize(vals)) |json| {
+                            before_json_copy = self.allocator.dupe(u8, json) catch null;
+                            before_json = before_json_copy;
+                        } else |_| {}
                     }
                     if (row_data.after_values) |vals| {
                         after_json = serializer.serialize(vals) catch null;

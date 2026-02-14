@@ -26,6 +26,7 @@ pub const Connection = struct {
         user: ?[]const u8,
         password: ?[]const u8,
         database: ?[]const u8,
+        ssl: bool,
     ) !Connection {
         // Resolve IP address via getaddrinfo
         const host_z = try allocator.dupeZ(u8, host);
@@ -65,6 +66,7 @@ pub const Connection = struct {
             .username = user_z,
             .password = pass_z,
             .database = db_z,
+            .ssl = ssl,
         });
 
         return Connection{
