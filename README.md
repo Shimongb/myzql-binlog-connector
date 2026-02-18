@@ -256,7 +256,7 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
 
 ## Table Filtering
 
-The connector supports optional `include` and `exclude` filters to control which tables are processed. Filtering is applied at the earliest possible point in the pipeline -- at `TABLE_MAP_EVENT` processing -- so excluded tables skip all downstream work: no row parsing, no JSON serialization, no Parquet output.
+The connector supports optional `include` and `exclude` filters to control which tables are processed. Filtering is applied at the earliest possible point in the pipeline - at `TABLE_MAP_EVENT` processing - so excluded tables skip all downstream work: no row parsing, no JSON serialization, no Parquet output.
 
 ### Pattern Format
 
