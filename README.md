@@ -1,6 +1,6 @@
 # MySQL Binlog Connector (Zig)
 
-A high-performance MySQL binary log reader implemented in pure Zig. No C FFI, no libmysqlclient -- the entire MySQL wire protocol, binlog event parsing, and Parquet output are native Zig code compiled into a single static binary.
+A high-performance MySQL binary log reader implemented in pure Zig. No C FFI, no libmysqlclient - the entire MySQL wire protocol, binlog event parsing, and Parquet output are native Zig code compiled into a single static binary.
 
 # Overview
 
@@ -35,7 +35,7 @@ It is built for Change Data Capture (CDC) pipelines, real-time replication monit
 The following diagram shows the complete data path from MySQL to output, including the responsibilities of each stage and the concurrent worker architecture used in Parquet mode.
 
 ```
-                          MySQL Binlog Connector -- End-to-End Flow
+                          MySQL Binlog Connector - End-to-End Flow
  ========================================================================================
 
   ┌──────────────────────────────────────────────────────────────────────────────────────┐
@@ -288,7 +288,7 @@ If no rule matches at any level, the **default behavior** depends on whether `in
 
 ### Examples
 
-**Blacklist mode** -- exclude specific schemas/tables, include everything else:
+**Blacklist mode** - exclude specific schemas/tables, include everything else:
 
 ```json
 {
@@ -296,7 +296,7 @@ If no rule matches at any level, the **default behavior** depends on whether `in
 }
 ```
 
-**Whitelist mode** -- include only specific schemas/tables:
+**Whitelist mode** - include only specific schemas/tables:
 
 ```json
 {
@@ -304,7 +304,7 @@ If no rule matches at any level, the **default behavior** depends on whether `in
 }
 ```
 
-**Mixed mode** -- include a schema but exclude specific tables from it:
+**Mixed mode** - include a schema but exclude specific tables from it:
 
 ```json
 {
@@ -315,7 +315,7 @@ If no rule matches at any level, the **default behavior** depends on whether `in
 
 Result: all `prod_db` tables are included **except** `debug_log` and `tmp_cache`. Tables in other schemas are excluded (whitelist mode).
 
-**Schema exclude with table override** -- exclude a schema but keep one table from it:
+**Schema exclude with table override** - exclude a schema but keep one table from it:
 
 ```json
 {
@@ -326,7 +326,7 @@ Result: all `prod_db` tables are included **except** `debug_log` and `tmp_cache`
 
 Result: `staging_db.important_table` is included (exact match overrides schema wildcard). All other `staging_db` tables are excluded. Tables in other schemas are excluded (whitelist mode, since `include` rules exist).
 
-**Cross-schema table exclude with override** -- exclude a table everywhere but keep it in one schema:
+**Cross-schema table exclude with override** - exclude a table everywhere but keep it in one schema:
 
 ```json
 {
@@ -348,7 +348,7 @@ The connector rejects configurations where the **exact same pattern** appears in
 }
 ```
 
-This produces a startup error: `ConflictingPattern`. Patterns at **different specificity levels** (e.g., `include: prod_db.users` + `exclude: prod_db.*`) are allowed -- the more specific rule wins at runtime.
+This produces a startup error: `ConflictingPattern`. Patterns at **different specificity levels** (e.g., `include: prod_db.users` + `exclude: prod_db.*`) are allowed - the more specific rule wins at runtime.
 
 ## Running
 
@@ -533,8 +533,8 @@ Each output file follows the Apache Parquet specification:
 
 The Parquet pipeline uses two dedicated worker threads connected by bounded MPSC queues:
 
-1. **Processing worker** -- deserializes row events, serializes column values to JSON, accumulates rows into columnar batches
-2. **Flush worker** -- writes Parquet pages to disk, handles GZIP compression, manages file rotation on binlog ROTATE events
+1. **Processing worker** - deserializes row events, serializes column values to JSON, accumulates rows into columnar batches
+2. **Flush worker** - writes Parquet pages to disk, handles GZIP compression, manages file rotation on binlog ROTATE events
 
 Both workers shut down gracefully via poison-pill messages propagated through the queues.
 
