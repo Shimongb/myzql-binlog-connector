@@ -16,6 +16,8 @@ It is built for Change Data Capture (CDC) pipelines, real-time replication monit
 - Binlog position control: start and stop at specific file/position pairs
 - Table filtering: include/exclude schemas and tables with specificity-based pattern matching
 - Complete column type support: JSON (binary format), DECIMAL(65,30), BIT, BLOB, DATETIME with microseconds, and 15+ other types
+- SSL/TLS support for encrypted MySQL connections (TLS 1.3)
+- DNS hostname resolution (literal IP, `/etc/hosts`, DNS A-record query) with no libc dependency on Linux
 - Single static binary with no runtime dependencies
 - Cross-compilation to aarch64-linux-gnu (AWS Lambda AL2023) from any host
 
@@ -52,6 +54,8 @@ The following diagram shows the complete data path from MySQL to output, includi
   │  Connection Layer                                                    connection.zig  │
   │                                                                                      │
   │  - TCP socket via native Zig MySQL client (src/mysql/)                               │
+  │  - DNS hostname resolution (literal IP, /etc/hosts, DNS query)              dns.zig  │
+  │  - SSL/TLS encryption (TLS 1.3 via Zig std.crypto.tls)                               │
   │  - Authentication handshake (caching_sha2, native_password, sha256)                  │
   │  - SET @master_binlog_checksum='CRC32'                                               │
   │  - Manual COM_BINLOG_DUMP packet construction                                        │
@@ -141,7 +145,7 @@ The following diagram shows the complete data path from MySQL to output, includi
 
 | Stage | Module(s) | Responsibility |
 |-------|-----------|----------------|
-| Connection | `connection.zig`, `mysql/` | TCP transport, MySQL authentication, COM_BINLOG_DUMP |
+| Connection | `connection.zig`, `dns.zig`, `mysql/` | TCP transport, DNS hostname resolution, SSL/TLS, MySQL authentication, COM_BINLOG_DUMP |
 | Parsing | `binlog_reader.zig`, `event_parser.zig` | 19-byte event headers, row deserialization, TABLE_MAP cache |
 | Type Decoding | `json_decoder.zig`, `decimal_parser.zig` | MySQL binary JSON, high-precision DECIMAL, complex column types |
 | Stdout Output | `output.zig` | Human-readable event display |
@@ -242,6 +246,8 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
 | `include` | string[] | no | `null` | Table filter include patterns (see [Table Filtering](#table-filtering)) |
 | `exclude` | string[] | no | `null` | Table filter exclude patterns (see [Table Filtering](#table-filtering)) |
 | `log_level` | string | no | `"info"` | Log verbosity: `"debug"`, `"info"`, `"warn"`, `"err"` |
+| `ssl` | boolean | no | `true` | Enable SSL/TLS encryption for the MySQL connection |
+| `pipeline_queue_capacity` | integer | no | `32` | Capacity of the bounded event queue between main thread and processing worker |
 | `log_file` | string | no | `null` | Write logs to file instead of stderr (plain text, no color) |
 
 ### Validation Rules
@@ -470,13 +476,14 @@ myzql-binlog-connector/
 │   ├── config.zig                JSON configuration parsing and validation
 │   ├── table_filter.zig          Table/schema inclusion-exclusion filter
 │   ├── log_config.zig            Logging subsystem (custom logFn, file output, runtime level)
-│   ├── connection.zig            MySQL connection lifecycle
+│   ├── connection.zig            MySQL connection lifecycle, hostname resolution
+│   ├── dns.zig                   DNS A-record resolver (literal IP, /etc/hosts, UDP query)
 │   ├── binlog_reader.zig         Binlog streaming, position tracking, TABLE_MAP cache
 │   ├── event_parser.zig          Row event parsing, column type deserialization
 │   ├── json_decoder.zig          MySQL binary JSON format decoder
 │   ├── decimal_parser.zig        DECIMAL(M,D) high-precision parser
 │   ├── pipeline.zig              Two-worker concurrent pipeline (parquet mode)
-│   ├── mpsc_queue.zig            Bounded MPSC ring buffer with mutex/condvar
+│   ├── mpsc_queue.zig            Bounded MPSC ring buffer with atomic spinlock
 │   ├── parquet_writer.zig        Native Parquet file writer
 │   ├── thrift_compact.zig        Thrift compact protocol encoder (for Parquet metadata)
 │   ├── row_json_serializer.zig   Row-to-JSON serializer with scratch buffer
