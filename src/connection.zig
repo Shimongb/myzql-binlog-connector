@@ -1,7 +1,8 @@
 //! MySQL Connection Management
 //!
 //! This module handles establishing and managing MySQL connections.
-//! It wraps the MySQL protocol implementation in src/mysql/.
+//! It resolves hostnames via dns.zig (literal IP, /etc/hosts, DNS query)
+//! and wraps the MySQL protocol implementation in src/mysql/.
 
 const std = @import("std");
 const posix = std.posix;
