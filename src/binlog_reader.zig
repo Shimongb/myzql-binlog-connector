@@ -111,7 +111,7 @@ pub const BinlogReader = struct {
 
         // Construct and send Binlog Dump command
         // We need to construct the packet payload manually
-        var payload = std.ArrayListUnmanaged(u8){};
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
         defer payload.deinit(self.allocator);
 
         const cmd = BinlogDumpCommand{
@@ -323,7 +323,7 @@ pub const BinlogReader = struct {
         // but the server is still in binlog dump mode and blocks indefinitely.
         // Using shutdown() instead of close() keeps the fd valid so conn.deinit()
         // can still call stream.close() without hitting EBADF.
-        _ = std.c.shutdown(self.conn.conn.stream.handle, 2); // SHUT_RDWR
+        _ = std.posix.system.shutdown(self.conn.conn.stream.handle, std.posix.SHUT.RDWR);
     }
 
     /// Pull-based event fetching for pipeline integration.

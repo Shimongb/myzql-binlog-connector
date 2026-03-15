@@ -213,13 +213,13 @@ pub const Pipeline = struct {
             .flush_metrics = .{},
         };
 
-        // Ensure output directory exists (use posix mkdir)
+        // Ensure output directory exists
         const dir_z = allocator.dupeZ(u8, output_dir) catch |err| {
             log.warn("could not alloc dir path '{s}': {}", .{ output_dir, err });
             return err;
         };
         defer allocator.free(dir_z);
-        _ = std.c.mkdir(dir_z.ptr, 0o755);
+        _ = std.posix.system.mkdir(dir_z.ptr, 0o755);
 
         // Spawn workers
         self.flush_thread = try std.Thread.spawn(.{}, flushWorker, .{self});

@@ -6,13 +6,14 @@
 //! - Colored stderr output (default, via std.log.defaultLog)
 
 const std = @import("std");
+const posix = std.posix;
 
 /// Runtime log level threshold. Messages above this level are suppressed.
 /// Set before any logging occurs via init().
 var runtime_level: std.log.Level = .info;
 
 /// File descriptor for log output. When null, logs go to stderr with color.
-var log_fd: ?std.posix.fd_t = null;
+var log_fd: ?posix.fd_t = null;
 
 /// Initialize the logging subsystem.
 /// Call once at startup, before any log statements execute.
@@ -20,7 +21,7 @@ pub fn init(level: std.log.Level, log_file_path: ?[]const u8) void {
     runtime_level = level;
 
     if (log_file_path) |path| {
-        log_fd = std.posix.openat(std.posix.AT.FDCWD, path, .{
+        log_fd = posix.openat(posix.AT.FDCWD, path, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .TRUNC = true,
@@ -31,7 +32,7 @@ pub fn init(level: std.log.Level, log_file_path: ?[]const u8) void {
 /// Close the log file if one was opened.
 pub fn deinit() void {
     if (log_fd) |fd| {
-        std.posix.close(fd);
+        _ = posix.system.close(fd);
         log_fd = null;
     }
 }
@@ -87,7 +88,7 @@ pub fn logFn(
             pos += 1;
         }
 
-        _ = std.c.write(fd, buf[0..pos].ptr, pos);
+        _ = posix.system.write(fd, buf[0..pos].ptr, pos);
     } else {
         // Stderr with color (Zig's default behavior)
         std.log.defaultLog(level, scope, format, args);
