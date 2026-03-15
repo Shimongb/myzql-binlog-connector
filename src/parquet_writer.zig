@@ -56,7 +56,7 @@ const PosixFile = struct {
     }
 
     fn close(self: PosixFile) void {
-        posix.close(self.fd);
+        _ = posix.system.close(self.fd);
     }
 };
 

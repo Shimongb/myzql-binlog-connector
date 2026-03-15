@@ -138,9 +138,9 @@ pub const Config = struct {
             log.err("failed to open config file '{s}': {}", .{ path, err });
             return ConfigError.FileNotFound;
         };
-        defer std.posix.close(fd);
+        defer _ = std.posix.system.close(fd);
 
-        // Get file size (fstat is void on Linux in Zig 0.16, use statx instead)
+        // Get file size
         const file_size: u64 = blk: {
             if (comptime @import("builtin").os.tag == .linux) {
                 const linux = std.os.linux;
@@ -150,7 +150,9 @@ pub const Config = struct {
                 if (!stx.mask.SIZE) return ConfigError.ParseError;
                 break :blk stx.size;
             } else {
-                const stat = try std.posix.fstat(fd);
+                // macOS/BSD: fstat via posix.system (routes to libc)
+                var stat: std.posix.system.Stat = undefined;
+                if (std.posix.system.fstat(fd, &stat) != 0) return ConfigError.ParseError;
                 break :blk @intCast(stat.size);
             }
         };

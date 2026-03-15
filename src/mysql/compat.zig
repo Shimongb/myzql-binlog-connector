@@ -20,7 +20,7 @@ pub const Stream = struct {
     tls_underlying_writer: ?*Io.Writer = null,
 
     pub fn close(s: Stream) void {
-        posix.close(s.handle);
+        _ = posix.system.close(s.handle);
     }
 
     pub fn read(s: *Stream, buffer: []u8) ReadError!usize {
@@ -119,7 +119,7 @@ pub fn tcpConnectToAddress(address: posix.sockaddr.in) !Stream {
         return posix.unexpectedErrno(errno);
     }
     const fd: posix.fd_t = @intCast(sock_fd);
-    errdefer posix.close(fd);
+    errdefer _ = posix.system.close(fd);
 
     // Set TCP_NODELAY to disable Nagle's algorithm
     const one: c_int = 1;
@@ -127,7 +127,10 @@ pub fn tcpConnectToAddress(address: posix.sockaddr.in) !Stream {
 
     // Connect
     const addr_ptr: *const posix.sockaddr = @ptrCast(&address);
-    try posix.connect(fd, addr_ptr, @sizeOf(posix.sockaddr.in));
+    const connect_rc = posix.system.connect(fd, addr_ptr, @sizeOf(posix.sockaddr.in));
+    if (posix.errno(connect_rc) != .SUCCESS) {
+        return posix.unexpectedErrno(posix.errno(connect_rc));
+    }
 
     return .{ .handle = fd };
 }

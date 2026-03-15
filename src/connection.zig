@@ -4,6 +4,8 @@
 //! It wraps the MySQL protocol implementation in src/mysql/.
 
 const std = @import("std");
+const posix = std.posix;
+const dns = @import("dns.zig");
 const mysql = struct {
     const conn = @import("mysql/conn.zig");
     const config = @import("mysql/config.zig");
@@ -28,30 +30,11 @@ pub const Connection = struct {
         database: ?[]const u8,
         ssl: bool,
     ) !Connection {
-        // Resolve IP address via getaddrinfo
-        const host_z = try allocator.dupeZ(u8, host);
-        defer allocator.free(host_z);
-
-        var port_buf: [6]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
-        const port_z = try allocator.dupeZ(u8, port_str);
-        defer allocator.free(port_z);
-
-        var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
-        hints.socktype = std.posix.SOCK.STREAM;
-
-        var ai_result: ?*std.c.addrinfo = null;
-        const rc = std.c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &ai_result);
-        if (@intFromEnum(rc) != 0 or ai_result == null) return error.HostNotFound;
-        defer std.c.freeaddrinfo(ai_result.?);
-
-        const ai = ai_result.?;
-
-        // Build sockaddr.in from resolved address
-        const address: std.posix.sockaddr.in = @bitCast(@as(
-            [@sizeOf(std.posix.sockaddr.in)]u8,
-            @as(*const [@sizeOf(std.posix.sockaddr.in)]u8, @ptrCast(ai.addr.?)).*,
-        ));
+        // Resolve host to IPv4 address (supports literal IPs, /etc/hosts, and DNS)
+        const address = resolveHost(host, port) catch |err| {
+            log.err("failed to resolve host '{s}': {}", .{ host, err });
+            return error.HostNotFound;
+        };
 
         // Create null-terminated strings for myzql
         const user_z = try allocator.dupeZ(u8, user orelse "root");
@@ -88,8 +71,6 @@ pub const Connection = struct {
     }
 
     /// Get MySQL server version string
-    /// Note: myzql might not expose this directly in the same way,
-    /// returning a placeholder or querying it if needed.
     pub fn getServerVersion(self: *Connection) []const u8 {
         _ = self;
         return "Unknown";
@@ -114,3 +95,36 @@ pub const Connection = struct {
         };
     }
 };
+
+/// Resolve a hostname or IP address to a sockaddr.in.
+/// Supports literal IPv4 addresses, /etc/hosts lookups, and DNS resolution.
+fn resolveHost(host: []const u8, port: u16) !posix.sockaddr.in {
+    const octets = dns.resolveHostToIpv4(host) catch |err| {
+        log.err("DNS resolution failed for '{s}': {}", .{ host, err });
+        return error.HostNotFound;
+    };
+    log.info("resolved '{s}' -> {d}.{d}.{d}.{d}", .{ host, octets[0], octets[1], octets[2], octets[3] });
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(octets),
+    };
+}
+
+test "resolveHost literal IP" {
+    const addr = try resolveHost("127.0.0.1", 3306);
+    const octets: [4]u8 = @bitCast(addr.addr);
+    try std.testing.expectEqual(@as(u8, 127), octets[0]);
+    try std.testing.expectEqual(@as(u8, 0), octets[1]);
+    try std.testing.expectEqual(@as(u8, 0), octets[2]);
+    try std.testing.expectEqual(@as(u8, 1), octets[3]);
+    try std.testing.expectEqual(std.mem.nativeToBig(u16, 3306), addr.port);
+}
+
+test "resolveHost localhost" {
+    const addr = resolveHost("localhost", 3306) catch return; // skip if no /etc/hosts
+    const octets: [4]u8 = @bitCast(addr.addr);
+    try std.testing.expectEqual(@as(u8, 127), octets[0]);
+    try std.testing.expectEqual(@as(u8, 0), octets[1]);
+    try std.testing.expectEqual(@as(u8, 0), octets[2]);
+    try std.testing.expectEqual(@as(u8, 1), octets[3]);
+}

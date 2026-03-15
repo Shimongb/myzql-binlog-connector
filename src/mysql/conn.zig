@@ -380,10 +380,10 @@ pub const Conn = struct {
             _ = std.os.linux.clock_gettime(.REALTIME, &ts);
             return ts.sec;
         } else {
-            // macOS / BSD
-            var tv: std.c.timeval = undefined;
-            _ = std.c.gettimeofday(&tv, null);
-            return tv.sec;
+            // macOS/BSD: clock_gettime via posix.system (routes to libc)
+            var ts: std.posix.system.timespec = undefined;
+            if (std.posix.system.clock_gettime(.REALTIME, &ts) != 0) return 0;
+            return ts.sec;
         }
     }
 
@@ -402,7 +402,8 @@ pub const Conn = struct {
                 }
             }
         } else {
-            std.c.arc4random_buf(buf.ptr, buf.len);
+            // macOS/BSD: arc4random_buf via posix.system (routes to libc)
+            std.posix.system.arc4random_buf(buf.ptr, buf.len);
         }
     }
 

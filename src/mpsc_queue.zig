@@ -1,7 +1,8 @@
 //! Bounded MPSC Queue
 //!
 //! A bounded, multi-producer single-consumer queue backed by a ring buffer.
-//! Uses mutex + condition variables for blocking push/pop semantics.
+//! Uses atomic spinlock + spin-wait for blocking push/pop semantics.
+//! No libc dependency — works on bare Linux and macOS alike.
 //! Supports graceful shutdown via close().
 
 const std = @import("std");
@@ -16,10 +17,23 @@ pub fn MpscQueue(comptime T: type) type {
         count: usize,
         capacity: usize,
         closed: bool,
-        mutex: std.Thread.Mutex,
-        not_empty: std.Thread.Condition,
-        not_full: std.Thread.Condition,
+        spin: SpinLock,
         allocator: std.mem.Allocator,
+
+        /// Simple atomic spinlock — no libc needed.
+        const SpinLock = struct {
+            state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+            fn lock(self: *SpinLock) void {
+                while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+                    std.atomic.spinLoopHint();
+                }
+            }
+
+            fn unlock(self: *SpinLock) void {
+                self.state.store(0, .release);
+            }
+        };
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             const buffer = try allocator.alloc(T, capacity);
@@ -30,9 +44,7 @@ pub fn MpscQueue(comptime T: type) type {
                 .count = 0,
                 .capacity = capacity,
                 .closed = false,
-                .mutex = .{},
-                .not_empty = .{},
-                .not_full = .{},
+                .spin = .{},
                 .allocator = allocator,
             };
         }
@@ -41,52 +53,60 @@ pub fn MpscQueue(comptime T: type) type {
             self.allocator.free(self.buffer);
         }
 
-        /// Push an item. Blocks if full. Returns false if queue is closed.
+        /// Push an item. Blocks (spins) if full. Returns false if queue is closed.
         pub fn push(self: *Self, item: T) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            while (true) {
+                self.spin.lock();
 
-            while (self.count == self.capacity and !self.closed) {
-                self.not_full.wait(&self.mutex);
+                if (self.closed) {
+                    self.spin.unlock();
+                    return false;
+                }
+
+                if (self.count < self.capacity) {
+                    self.buffer[self.head] = item;
+                    self.head = (self.head + 1) % self.capacity;
+                    self.count += 1;
+                    self.spin.unlock();
+                    return true;
+                }
+
+                // Queue full — release lock, spin-wait, retry
+                self.spin.unlock();
+                std.atomic.spinLoopHint();
             }
-
-            if (self.closed) return false;
-
-            self.buffer[self.head] = item;
-            self.head = (self.head + 1) % self.capacity;
-            self.count += 1;
-
-            self.not_empty.signal();
-            return true;
         }
 
-        /// Pop an item. Blocks if empty. Returns null if queue is closed AND empty.
+        /// Pop an item. Blocks (spins) if empty. Returns null if queue is closed AND empty.
         pub fn pop(self: *Self) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            while (true) {
+                self.spin.lock();
 
-            while (self.count == 0 and !self.closed) {
-                self.not_empty.wait(&self.mutex);
+                if (self.count > 0) {
+                    const item = self.buffer[self.tail];
+                    self.tail = (self.tail + 1) % self.capacity;
+                    self.count -= 1;
+                    self.spin.unlock();
+                    return item;
+                }
+
+                if (self.closed) {
+                    self.spin.unlock();
+                    return null; // closed and empty
+                }
+
+                // Queue empty — release lock, spin-wait, retry
+                self.spin.unlock();
+                std.atomic.spinLoopHint();
             }
-
-            if (self.count == 0) return null; // closed and empty
-
-            const item = self.buffer[self.tail];
-            self.tail = (self.tail + 1) % self.capacity;
-            self.count -= 1;
-
-            self.not_full.signal();
-            return item;
         }
 
-        /// Close the queue. Wakes all waiting threads.
+        /// Close the queue. Subsequent pushes return false.
+        /// Pop continues to drain remaining items, then returns null.
         pub fn close(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
+            self.spin.lock();
             self.closed = true;
-            self.not_empty.broadcast();
-            self.not_full.broadcast();
+            self.spin.unlock();
         }
     };
 }

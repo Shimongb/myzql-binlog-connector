@@ -150,7 +150,7 @@ pub fn encryptPassword(allocator: std.mem.Allocator, password: []const u8, seed:
 }
 
 /// Fill buffer with cryptographically secure random bytes.
-/// Uses arc4random_buf on BSD/macOS, getrandom syscall on Linux.
+/// Uses getrandom syscall on Linux, arc4random_buf via posix.system on macOS/BSD.
 fn fillRandomBytes(buf: []u8) void {
     if (comptime builtin.os.tag == .linux) {
         // Linux: use getrandom syscall directly (available since kernel 3.17)
@@ -163,13 +163,12 @@ fn fillRandomBytes(buf: []u8) void {
             } else if (errno == .INTR) {
                 continue;
             } else {
-                // Should not happen with flags=0, but fall through
                 @panic("getrandom failed");
             }
         }
     } else {
-        // macOS, FreeBSD, etc: arc4random_buf is always available
-        std.c.arc4random_buf(buf.ptr, buf.len);
+        // macOS/BSD: arc4random_buf via posix.system (routes to libc)
+        std.posix.system.arc4random_buf(buf.ptr, buf.len);
     }
 }
 

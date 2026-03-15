@@ -20,12 +20,16 @@ pub fn build(b: *std.Build) void {
     // Optimization level
     const optimize = b.standardOptimizeOption(.{});
 
+    // Link libc only on platforms that require it (macOS has no stable syscall ABI).
+    // On Linux, we use direct syscalls via std.os.linux — no libc needed.
+    const needs_libc = target.result.os.tag.isDarwin();
+
     // Create library module (optional - for reuse in other Zig projects)
     const mod = b.addModule("myzql_binlog_connector", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .link_libc = needs_libc,
     });
 
     // === EXECUTABLE DEFINITION ===
@@ -35,7 +39,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .link_libc = true,
+            .link_libc = needs_libc,
             .imports = &.{
                 .{ .name = "myzql_binlog_connector", .module = mod },
             },
