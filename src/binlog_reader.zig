@@ -14,6 +14,9 @@ const output = @import("output.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const TableFilter = config_mod.table_filter.TableFilter;
+const schema_cache_mod = @import("schema_cache.zig");
+const SchemaCache = schema_cache_mod.SchemaCache;
+const ddl_handler = @import("ddl_handler.zig");
 
 const log = std.log.scoped(.binlog_reader);
 
@@ -54,12 +57,15 @@ pub const BinlogReader = struct {
     // Format description info from FORMAT_DESCRIPTION_EVENT
     format_description: ?event_parser.FormatDescriptionInfo,
 
+    // Schema cache for column name resolution
+    schema_cache: SchemaCache,
+
     // Table filter for include/exclude logic
     table_filter: ?TableFilter,
     tables_filtered: u64,
 
-    /// Initialize binlog reader with a connection
-    pub fn init(allocator: std.mem.Allocator, conn: *connection.Connection, config: Config) !BinlogReader {
+    /// Initialize binlog reader with a connection and optional secondary connection for DESCRIBE
+    pub fn init(allocator: std.mem.Allocator, conn: *connection.Connection, config: Config, describe_conn: ?*connection.Connection) !BinlogReader {
         const binlog_file_copy = try allocator.dupe(u8, config.from_binlog_file);
         errdefer allocator.free(binlog_file_copy);
 
@@ -78,6 +84,7 @@ pub const BinlogReader = struct {
             .current_position = config.from_binlog_position,
             .table_cache = std.AutoHashMap(u64, event_parser.TableMetadata).init(allocator),
             .format_description = null,
+            .schema_cache = SchemaCache.init(allocator, describe_conn),
             .table_filter = filter,
             .tables_filtered = 0,
         };
@@ -91,6 +98,7 @@ pub const BinlogReader = struct {
             metadata.deinit(self.allocator);
         }
         self.table_cache.deinit();
+        self.schema_cache.deinit();
         if (self.table_filter) |*f| {
             f.deinit();
         }
@@ -234,6 +242,19 @@ pub const BinlogReader = struct {
                 self.format_description = format_desc;
                 log.info("format description: binlog_version={d}", .{format_desc.binlog_version});
             },
+            .QUERY_EVENT => {
+                // Detect and apply DDL changes to schema cache
+                if (ddl_handler.parseQueryEvent(event.data)) |qe| {
+                    ddl_handler.handleDdl(
+                        self.allocator,
+                        &self.schema_cache,
+                        qe.sql,
+                        qe.schema,
+                        self.current_binlog_file,
+                        self.current_position,
+                    );
+                }
+            },
             .TABLE_MAP_EVENT => {
                 const table_metadata = try event_parser.parseTableMapEvent(self.allocator, event.data);
                 errdefer table_metadata.deinit(self.allocator);
@@ -242,6 +263,15 @@ pub const BinlogReader = struct {
                     old_entry.value.deinit(self.allocator);
                 }
                 try self.table_cache.put(table_metadata.table_id, table_metadata);
+
+                // Resolve column names for this table
+                _ = self.schema_cache.resolveColumns(
+                    table_metadata.database_name,
+                    table_metadata.table_name,
+                    table_metadata.column_count,
+                    table_metadata.column_types,
+                    self.current_binlog_file,
+                ) catch {};
 
                 log.debug("table_map: {s}.{s} (id={d})", .{ table_metadata.database_name, table_metadata.table_name, table_metadata.table_id });
             },
@@ -266,8 +296,15 @@ pub const BinlogReader = struct {
                         }
                         self.allocator.free(row_events);
                     }
+
+                    // Look up resolved columns from schema cache
+                    const resolved = if (self.schema_cache.get(metadata.database_name, metadata.table_name)) |schema|
+                        schema.resolved_columns
+                    else
+                        null;
+
                     for (row_events) |row_event| {
-                        output.printRowEvent(event, row_event);
+                        output.printRowEventWithColumns(event, row_event, resolved);
                     }
                 } else {
                     output.printEvent(event);
@@ -333,6 +370,7 @@ pub const BinlogReader = struct {
             event: event_parser.Event,
             row_events: []event_parser.RowEvent,
             table_metadata: event_parser.TableMetadata,
+            resolved_columns: ?[]const schema_cache_mod.ColumnInfo,
         },
         rotate: struct {
             next_binlog_file: []const u8,
@@ -391,6 +429,20 @@ pub const BinlogReader = struct {
 
                 return .{ .rotate = .{ .next_binlog_file = rotate.next_binlog_file } };
             },
+            .QUERY_EVENT => {
+                // Detect and apply DDL changes to schema cache
+                if (ddl_handler.parseQueryEvent(event.data)) |qe| {
+                    ddl_handler.handleDdl(
+                        self.allocator,
+                        &self.schema_cache,
+                        qe.sql,
+                        qe.schema,
+                        self.current_binlog_file,
+                        self.current_position,
+                    );
+                }
+                return .skip;
+            },
             .FORMAT_DESCRIPTION_EVENT => {
                 const format_desc = try event_parser.parseFormatDescriptionEvent(event.data);
                 self.format_description = format_desc;
@@ -420,6 +472,15 @@ pub const BinlogReader = struct {
                     old_entry.value.deinit(self.allocator);
                 }
                 try self.table_cache.put(table_metadata.table_id, table_metadata);
+
+                // Resolve column names for this table
+                _ = self.schema_cache.resolveColumns(
+                    table_metadata.database_name,
+                    table_metadata.table_name,
+                    table_metadata.column_count,
+                    table_metadata.column_types,
+                    self.current_binlog_file,
+                ) catch {};
 
                 log.debug("table_map: {s}.{s} (id={d})", .{ table_metadata.database_name, table_metadata.table_name, table_metadata.table_id });
                 return .skip;
@@ -454,10 +515,17 @@ pub const BinlogReader = struct {
                         }
                     }
 
+                    // Look up resolved columns from schema cache
+                    const resolved = if (self.schema_cache.get(metadata.database_name, metadata.table_name)) |schema|
+                        schema.resolved_columns
+                    else
+                        null;
+
                     return .{ .rows = .{
                         .event = event,
                         .row_events = row_events,
                         .table_metadata = metadata,
+                        .resolved_columns = resolved,
                     } };
                 }
                 return .skip;

@@ -20,6 +20,8 @@
 
 const std = @import("std");
 const event_parser = @import("event_parser.zig");
+const schema_cache_mod = @import("schema_cache.zig");
+const ColumnInfo = schema_cache_mod.ColumnInfo;
 
 /// Helper to format a RowValue for human-readable output
 fn formatRowValue(value: event_parser.RowValue) void {
@@ -152,6 +154,11 @@ pub fn printBinlogPosition(filename: []const u8, position: u64) void {
 
 /// Print detailed ROW event (DML operations)
 pub fn printRowEvent(event: event_parser.Event, row_event: event_parser.RowEvent) void {
+    printRowEventWithColumns(event, row_event, null);
+}
+
+/// Print detailed ROW event with optional column names.
+pub fn printRowEventWithColumns(event: event_parser.Event, row_event: event_parser.RowEvent, resolved_columns: ?[]const ColumnInfo) void {
     std.debug.print("=== DML Event ({s}) ===\n", .{row_event.dmlTypeName()});
     std.debug.print("Table:     {s}.{s}\n", .{
         row_event.table_metadata.database_name,
@@ -178,7 +185,15 @@ pub fn printRowEvent(event: event_parser.Event, row_event: event_parser.RowEvent
     if (row_event.before_values) |before| {
         std.debug.print("\nBefore Values ({d} columns):\n", .{before.len});
         for (before, 0..) |value, i| {
-            std.debug.print("  [{d}] ", .{i});
+            if (resolved_columns) |cols| {
+                if (i < cols.len) {
+                    std.debug.print("  {s}: ", .{cols[i].column_name});
+                } else {
+                    std.debug.print("  [{d}] ", .{i});
+                }
+            } else {
+                std.debug.print("  [{d}] ", .{i});
+            }
             formatRowValue(value);
             std.debug.print("\n", .{});
         }
@@ -188,7 +203,15 @@ pub fn printRowEvent(event: event_parser.Event, row_event: event_parser.RowEvent
     if (row_event.after_values) |after| {
         std.debug.print("\nAfter Values ({d} columns):\n", .{after.len});
         for (after, 0..) |value, i| {
-            std.debug.print("  [{d}] ", .{i});
+            if (resolved_columns) |cols| {
+                if (i < cols.len) {
+                    std.debug.print("  {s}: ", .{cols[i].column_name});
+                } else {
+                    std.debug.print("  [{d}] ", .{i});
+                }
+            } else {
+                std.debug.print("  [{d}] ", .{i});
+            }
             formatRowValue(value);
             std.debug.print("\n", .{});
         }

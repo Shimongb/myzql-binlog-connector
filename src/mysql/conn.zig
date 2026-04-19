@@ -2,7 +2,17 @@
 // Originally from myzql library (MIT License, Copyright (c) 2023 Zack).
 const std = @import("std");
 const builtin = @import("builtin");
-const tls = std.crypto.tls;
+const tls = @import("tls");
+
+/// Heap-allocated container for the ianic/tls.zig handles.
+/// The Connection, Reader, and Writer all store pointers at each other
+/// (Reader/Writer use @fieldParentPtr on their .interface field), so they
+/// must live at stable addresses for the lifetime of the TLS session.
+const TlsHandles = struct {
+    conn: tls.Connection,
+    reader: tls.Connection.Reader,
+    writer: tls.Connection.Writer,
+};
 
 const auth = @import("auth.zig");
 const AuthPlugin = auth.AuthPlugin;
@@ -34,7 +44,7 @@ pub const Conn = struct {
 
     // TLS resources (heap-allocated, null when not using TLS)
     socket_io: ?*SocketIo = null,
-    tls_client: ?*tls.Client = null,
+    tls_handles: ?*TlsHandles = null,
     tls_read_buf: ?[]u8 = null,
     tls_write_buf: ?[]u8 = null,
     tls_app_read_buf: ?[]u8 = null,
@@ -304,8 +314,12 @@ pub const Conn = struct {
         try conn.writeBytesAsPacket(&ssl_request);
         try conn.writer.flush();
 
-        // Step 2: Allocate TLS resources
-        const buf_len = tls.Client.min_buffer_len;
+        // Step 2: Allocate transport + cleartext buffers.
+        // ianic/tls.zig requires the underlying Reader buffer to be >=
+        // input_buffer_len (max ciphertext record = 16645 B) and the
+        // underlying Writer buffer to be >= 2048 B. Using a single size
+        // keeps things simple.
+        const buf_len = tls.input_buffer_len;
 
         const socket_io = try allocator.create(SocketIo);
         errdefer allocator.destroy(socket_io);
@@ -325,47 +339,61 @@ pub const Conn = struct {
         // Initialize the socket I/O bridge (raw fd -> Io.Reader/Writer vtables)
         socket_io.init(conn.stream.handle, tls_read_buf, tls_write_buf);
 
-        // Step 3: Generate entropy
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        fillRandomBytes(&entropy);
+        // Step 3: Allocate the TLS handles container at a stable address —
+        // Reader and Writer use @fieldParentPtr on their .interface field, so
+        // none of these values may be moved after init.
+        const handles = try allocator.create(TlsHandles);
+        errdefer allocator.destroy(handles);
 
-        // Step 4: Perform TLS handshake
-        var tls_alert: tls.Alert = undefined;
-        const tls_client_val = tls.Client.init(
+        // Step 4: Seed a CSPRNG for the handshake. ianic wants a std.Random
+        // instance; its examples use std.Random.IoSource which requires an
+        // Io dispatch instance (juicy main). We don't plumb Io down today,
+        // so we seed a ChaCha-based CSPRNG from our libc-free entropy source.
+        var prng_seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+        fillRandomBytes(&prng_seed);
+        var prng = std.Random.DefaultCsprng.init(prng_seed);
+
+        // Step 5: Perform TLS handshake.
+        // MySQL 8.0 sends a TLS 1.3 CertificateRequest by default; ianic's
+        // client responds with an empty Certificate message automatically
+        // when no `auth` is supplied.
+        handles.conn = tls.client(
             &socket_io.reader_iface,
             &socket_io.writer_iface,
             .{
-                .host = .no_verification,
-                .ca = .no_verification,
-                .read_buffer = tls_app_read_buf,
-                .write_buffer = tls_app_write_buf,
-                .entropy = &entropy,
-                .realtime_now_seconds = realtimeSeconds(),
-                .allow_truncation_attacks = true,
-                .alert = &tls_alert,
+                .rng = prng.random(),
+                .now = realtimeTimestamp(),
+                // We don't validate the server cert (insecure_skip_verify),
+                // so `host` is only used as the SNI extension value. Config
+                // resolves the hostname into sockaddr.in before reaching us
+                // and doesn't retain the string. A literal placeholder keeps
+                // the SNI well-formed (some servers reject empty SNI).
+                .host = "mysql",
+                .root_ca = .empty,
+                .insecure_skip_verify = true,
             },
         ) catch |err| {
-            std.log.err("TLS handshake failed: {} alert={any}", .{ err, tls_alert });
+            std.log.err("TLS handshake failed: {}", .{err});
             return error.TlsHandshakeFailed;
         };
 
-        // Step 5: Heap-allocate the TLS Client (must not move — uses @fieldParentPtr internally)
-        const tls_client = try allocator.create(tls.Client);
-        errdefer allocator.destroy(tls_client);
-        tls_client.* = tls_client_val;
+        // Step 6: Build the cleartext Reader/Writer over the Connection.
+        handles.reader = handles.conn.reader(tls_app_read_buf);
+        handles.writer = handles.conn.writer(tls_app_write_buf);
 
-        // Step 6: Switch stream to use TLS
-        conn.stream.tls_reader = &tls_client.reader;
-        conn.stream.tls_writer = &tls_client.writer;
+        // Step 7: Switch stream to use TLS (point at the Io.Reader/Writer
+        // interfaces that ianic's Reader/Writer expose).
+        conn.stream.tls_reader = &handles.reader.interface;
+        conn.stream.tls_writer = &handles.writer.interface;
         conn.stream.tls_underlying_writer = &socket_io.writer_iface;
 
-        // Step 7: Update reader/writer (they store stream by value)
+        // Step 8: Update reader/writer (they store stream by value)
         conn.reader.stream = conn.stream;
         conn.writer.stream = conn.stream;
 
-        // Step 8: Store TLS resources for cleanup
+        // Step 9: Store TLS resources for cleanup
         conn.socket_io = socket_io;
-        conn.tls_client = tls_client;
+        conn.tls_handles = handles;
         conn.tls_read_buf = tls_read_buf;
         conn.tls_write_buf = tls_write_buf;
         conn.tls_app_read_buf = tls_app_read_buf;
@@ -374,16 +402,16 @@ pub const Conn = struct {
         std.log.info("TLS connection established", .{});
     }
 
-    fn realtimeSeconds() i64 {
+    fn realtimeTimestamp() std.Io.Timestamp {
         if (comptime builtin.os.tag == .linux) {
             var ts: std.os.linux.timespec = undefined;
             _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-            return ts.sec;
+            return .{ .nanoseconds = @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec };
         } else {
             // macOS/BSD: clock_gettime via posix.system (routes to libc)
             var ts: std.posix.system.timespec = undefined;
-            if (std.posix.system.clock_gettime(.REALTIME, &ts) != 0) return 0;
-            return ts.sec;
+            if (std.posix.system.clock_gettime(.REALTIME, &ts) != 0) return .{ .nanoseconds = 0 };
+            return .{ .nanoseconds = @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec };
         }
     }
 
@@ -415,7 +443,7 @@ pub const Conn = struct {
         c.result_meta.deinit(allocator);
 
         // Free TLS resources
-        if (c.tls_client) |tc| allocator.destroy(tc);
+        if (c.tls_handles) |th| allocator.destroy(th);
         if (c.socket_io) |sio| allocator.destroy(sio);
         if (c.tls_read_buf) |buf| allocator.free(buf);
         if (c.tls_write_buf) |buf| allocator.free(buf);
@@ -443,6 +471,121 @@ pub const Conn = struct {
         try c.writer.flush();
         const packet = try c.readPacket();
         return c.queryResult(&packet);
+    }
+
+    /// A single row from a text protocol result set.
+    /// Each element is either a column value (string) or null.
+    pub const TextRow = struct {
+        values: []?[]const u8,
+
+        pub fn deinit(self: *TextRow, allocator: std.mem.Allocator) void {
+            if (self.values.len > 0) {
+                allocator.free(self.values);
+            }
+        }
+    };
+
+    /// Result of a query that returns rows (text protocol).
+    pub const TextResultSet = struct {
+        column_count: usize,
+        rows: []TextRow,
+        /// Arena that owns all the string data in rows
+        arena: std.heap.ArenaAllocator,
+
+        pub fn deinit(self: *TextResultSet) void {
+            // The arena owns all row data and value slices
+            self.arena.deinit();
+        }
+    };
+
+    /// Execute a query and read the full text protocol result set.
+    /// Returns rows with string values. Caller must call deinit() on the result.
+    pub fn queryRows(c: *Conn, allocator: std.mem.Allocator, query_string: []const u8) !TextResultSet {
+        c.ready();
+        const query_req: QueryRequest = .{ .query = query_string };
+        try c.writePacket(query_req);
+        try c.writer.flush();
+
+        // Read first packet - could be OK, ERR, or column count
+        const first_packet = try c.readPacket();
+
+        if (first_packet.payload.len == 0) return error.EmptyPacket;
+
+        // Check for error
+        if (first_packet.payload[0] == constants.ERR) {
+            const err_pkt = ErrorPacket.init(&first_packet);
+            std.log.err("query error: {s}", .{err_pkt.error_message});
+            return error.QueryError;
+        }
+
+        // Check for OK (no result set)
+        if (first_packet.payload[0] == constants.OK) {
+            return error.NoResultSet;
+        }
+
+        // First byte is the column count (length-encoded integer)
+        var reader = first_packet.reader();
+        const column_count = reader.readLengthEncodedInteger();
+
+        // Use an arena for all result data
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // Read column definition packets
+        for (0..column_count) |_| {
+            _ = try c.readPacket(); // Skip column definitions, we don't need them
+        }
+
+        // Read EOF packet after column definitions (if not CLIENT_DEPRECATE_EOF)
+        if (c.capabilities & constants.CLIENT_DEPRECATE_EOF == 0) {
+            const eof_packet = try c.readPacket();
+            if (eof_packet.payload.len > 0 and eof_packet.payload[0] != constants.EOF) {
+                return error.ExpectedEof;
+            }
+        }
+
+        // Read rows until EOF
+        var rows: std.ArrayList(TextRow) = .empty;
+
+        while (true) {
+            const row_packet = try c.readPacket();
+
+            if (row_packet.payload.len == 0) break;
+
+            // Check for EOF
+            if (row_packet.payload[0] == constants.EOF and row_packet.payload.len < 9) {
+                break;
+            }
+
+            // Check for error
+            if (row_packet.payload[0] == constants.ERR) {
+                return error.QueryError;
+            }
+
+            // Parse text protocol row
+            var row_reader = row_packet.reader();
+            const values = try arena_alloc.alloc(?[]const u8, @intCast(column_count));
+
+            for (0..@intCast(column_count)) |col_idx| {
+                // Check for NULL (0xFB)
+                if (row_reader.pos < row_reader.payload.len and row_reader.payload[row_reader.pos] == constants.TEXT_RESULT_ROW_NULL) {
+                    row_reader.pos += 1;
+                    values[col_idx] = null;
+                } else {
+                    const val = row_reader.readLengthEncodedString();
+                    values[col_idx] = try arena_alloc.dupe(u8, val);
+                }
+            }
+
+            try rows.append(arena_alloc, .{ .values = values });
+        }
+
+        return .{
+            .column_count = @intCast(column_count),
+            .rows = try rows.toOwnedSlice(arena_alloc),
+            .arena = arena,
+        };
     }
 
     fn quit(c: *Conn) !void {

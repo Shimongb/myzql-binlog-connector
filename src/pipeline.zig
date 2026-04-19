@@ -16,6 +16,8 @@ const RowJsonSerializer = @import("row_json_serializer.zig").RowJsonSerializer;
 const event_parser = @import("event_parser.zig");
 const metrics = @import("metrics.zig");
 const PipelineMetrics = metrics.PipelineMetrics;
+const schema_cache_mod = @import("schema_cache.zig");
+const ColumnInfo = schema_cache_mod.ColumnInfo;
 
 const log = std.log.scoped(.pipeline);
 
@@ -30,6 +32,7 @@ pub const RowEventData = struct {
     dml_type: event_parser.DmlType,
     before_values: ?[]event_parser.RowValue,
     after_values: ?[]event_parser.RowValue,
+    resolved_columns: ?[]ColumnInfo,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *RowEventData) void {
@@ -37,6 +40,10 @@ pub const RowEventData = struct {
         if (self.table_name) |t| self.allocator.free(t);
         freeRowValues(self.allocator, self.before_values);
         freeRowValues(self.allocator, self.after_values);
+        if (self.resolved_columns) |cols| {
+            for (cols) |*col| col.deinit(self.allocator);
+            self.allocator.free(cols);
+        }
     }
 
     fn freeRowValues(allocator: std.mem.Allocator, values: ?[]event_parser.RowValue) void {
@@ -289,13 +296,13 @@ pub const Pipeline = struct {
                     defer if (before_json_copy) |b| self.allocator.free(b);
 
                     if (row_data.before_values) |vals| {
-                        if (serializer.serialize(vals)) |json| {
+                        if (serializer.serializeWithColumns(vals, row_data.resolved_columns)) |json| {
                             before_json_copy = self.allocator.dupe(u8, json) catch null;
                             before_json = before_json_copy;
                         } else |_| {}
                     }
                     if (row_data.after_values) |vals| {
-                        after_json = serializer.serialize(vals) catch null;
+                        after_json = serializer.serializeWithColumns(vals, row_data.resolved_columns) catch null;
                     }
 
                     const dml_str: []const u8 = switch (row_data.dml_type) {

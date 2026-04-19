@@ -10,7 +10,16 @@
     // another.
     .fingerprint = 0xa9a3ac48eea14d1, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .tls = .{
+            .url = "https://github.com/ianic/tls.zig/archive/fe60069029602fb0ca7129f35c1af7c97d6d2473.tar.gz",
+            .hash = "tls-0.1.0-ER2e0kOpBQCRFI5ZJTlpYIKYTkYM5eNvBBkBf9MZteut",
+        },
+        .myzqlparser = .{
+            .url = "git+https://github.com/Shimongb/myzqlparser.git#267521c65fa0b67c06638103ca8f9f205d321e66",
+            .hash = "myzqlparser-0.0.0-lIB8H7_aCQD6DpcKOlSCtsPNL_EtBNrs_AZAA6yAFp0j",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
