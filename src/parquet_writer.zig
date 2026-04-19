@@ -169,34 +169,51 @@ pub const RowBatch = struct {
 };
 
 pub const ParquetWriter = struct {
-    file: PosixFile,
+    // File creation is deferred until the first row group is written. This
+    // avoids emitting zero-row parquet files on binlog rotations that carry
+    // no DML (e.g. idle segments). An empty-but-valid parquet is still
+    // readable individually, but mixing them into a directory glob makes
+    // downstream readers iterate extra files for no benefit — and a broken
+    // empty file (pre-0.16 gzip bug) would poison the whole glob.
+    file: ?PosixFile,
+    file_path: []const u8,
     allocator: std.mem.Allocator,
     row_groups: std.ArrayList(RowGroupInfo),
     total_rows: i64,
     bytes_written: u64,
 
     pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !ParquetWriter {
-        const file = try PosixFile.create(file_path);
-        errdefer file.close();
-
-        // Write magic
-        try file.writeAll(PARQUET_MAGIC);
-
         return ParquetWriter{
-            .file = file,
+            .file = null,
+            .file_path = try allocator.dupe(u8, file_path),
             .allocator = allocator,
             .row_groups = .empty,
             .total_rows = 0,
-            .bytes_written = 4, // magic
+            .bytes_written = 0,
         };
     }
 
     pub fn deinit(self: *ParquetWriter) void {
         self.row_groups.deinit(self.allocator);
-        self.file.close();
+        if (self.file) |f| f.close();
+        self.allocator.free(self.file_path);
+    }
+
+    /// Lazily open the file and write the leading PAR1 magic on first use.
+    fn ensureOpen(self: *ParquetWriter) !*PosixFile {
+        if (self.file == null) {
+            const f = try PosixFile.create(self.file_path);
+            self.file = f;
+            try f.writeAll(PARQUET_MAGIC);
+            self.bytes_written = 4;
+        }
+        return &self.file.?;
     }
 
     pub fn writeRowGroup(self: *ParquetWriter, batch: *const RowBatch) !void {
+        if (batch.count == 0) return;
+        _ = try self.ensureOpen();
+
         var rg_info: RowGroupInfo = undefined;
         rg_info.num_rows = @intCast(batch.count);
         var total_byte_size: i64 = 0;
@@ -247,9 +264,15 @@ pub const ParquetWriter = struct {
             .default,
         );
 
-        // Write uncompressed data through compressor
+        // Write uncompressed data through compressor.
+        // NOTE: Zig 0.16.0's std.compress.flate splits stream termination into
+        // two steps — `flush` only sync-aligns buffered bytes, while `finish`
+        // emits the final deflate block *and* the gzip trailer (CRC32+ISIZE).
+        // Using `flush` here produced truncated gzip streams that downstream
+        // readers (DuckDB, Python gzip) rejected with "data error" / "ended
+        // before end-of-stream marker". `finish` is the correct terminator.
         compressor.writer.writeAll(data_buf.items) catch return error.CompressionFailed;
-        compressor.writer.flush() catch return error.CompressionFailed;
+        compressor.finish() catch return error.CompressionFailed;
 
         const compressed_data = output_alloc.written();
 
@@ -290,9 +313,11 @@ pub const ParquetWriter = struct {
         const file_offset: i64 = @intCast(self.bytes_written);
         const data_page_offset = file_offset;
 
-        // Write page header + compressed data
-        try self.file.writeAll(page_header_buf.items);
-        try self.file.writeAll(compressed_data);
+        // Write page header + compressed data.
+        // `writeRowGroup` has already ensured the file is open, so unwrap directly.
+        const file = &self.file.?;
+        try file.writeAll(page_header_buf.items);
+        try file.writeAll(compressed_data);
 
         const total_written = page_header_buf.items.len + compressed_data.len;
         self.bytes_written += total_written;
@@ -426,6 +451,14 @@ pub const ParquetWriter = struct {
     }
 
     pub fn finish(self: *ParquetWriter) !void {
+        // If no row groups were written, no file was ever created — skip the
+        // footer entirely so the output directory stays free of zero-row
+        // parquets. Downstream readers using `dir/*.parquet` globs would
+        // otherwise have to open (and tolerate) empty files on every rotate.
+        if (self.file == null or self.row_groups.items.len == 0) {
+            return;
+        }
+
         // Encode FileMetaData using Thrift compact protocol
         var tw = thrift.ThriftCompactWriter.init(self.allocator);
         defer tw.deinit();
@@ -527,16 +560,17 @@ pub const ParquetWriter = struct {
 
         try tw.endRootStruct();
 
-        // Write footer
+        // Write footer. The early-return above guarantees `self.file` is non-null here.
+        const file = &self.file.?;
         const footer_data = tw.getWritten();
-        try self.file.writeAll(footer_data);
+        try file.writeAll(footer_data);
 
         // Write footer length (4 bytes LE)
         const footer_len: u32 = @intCast(footer_data.len);
-        try self.file.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, footer_len)));
+        try file.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, footer_len)));
 
         // Write trailing magic
-        try self.file.writeAll(PARQUET_MAGIC);
+        try file.writeAll(PARQUET_MAGIC);
 
         self.bytes_written += footer_data.len + 4 + 4;
     }
