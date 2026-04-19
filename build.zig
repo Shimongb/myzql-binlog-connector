@@ -24,12 +24,27 @@ pub fn build(b: *std.Build) void {
     // On Linux, we use direct syscalls via std.os.linux — no libc needed.
     const needs_libc = target.result.os.tag.isDarwin();
 
+    // === SQL PARSER DEPENDENCY ===
+    const myzqlparser_dep = b.dependency("myzqlparser", .{ .target = target });
+    const myzqlparser_mod = myzqlparser_dep.module("myzqlparser");
+
+    // === TLS DEPENDENCY (ianic/tls.zig) ===
+    // Replaces the previous std.crypto.tls + local CertificateRequest patch
+    // with a maintained external implementation that handles TLS 1.3
+    // CertificateRequest → empty Certificate response natively.
+    const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
+    const tls_mod = tls_dep.module("tls");
+
     // Create library module (optional - for reuse in other Zig projects)
     const mod = b.addModule("myzql_binlog_connector", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = needs_libc,
+        .imports = &.{
+            .{ .name = "myzqlparser", .module = myzqlparser_mod },
+            .{ .name = "tls", .module = tls_mod },
+        },
     });
 
     // === EXECUTABLE DEFINITION ===
@@ -42,6 +57,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = needs_libc,
             .imports = &.{
                 .{ .name = "myzql_binlog_connector", .module = mod },
+                .{ .name = "myzqlparser", .module = myzqlparser_mod },
+                .{ .name = "tls", .module = tls_mod },
             },
         }),
     });

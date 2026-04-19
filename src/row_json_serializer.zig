@@ -6,6 +6,8 @@
 const std = @import("std");
 const event_parser = @import("event_parser.zig");
 const ArrayListWriter = @import("array_writer.zig").ArrayListWriter;
+const schema_cache_mod = @import("schema_cache.zig");
+const ColumnInfo = schema_cache_mod.ColumnInfo;
 
 /// A simple writer that writes to a fixed buffer, returning error.NoSpaceLeft on overflow.
 const FixedBufWriter = struct {
@@ -52,25 +54,31 @@ pub const RowJsonSerializer = struct {
     }
 
     /// Serialize a row of values to a JSON object string.
-    /// Column names are "c0", "c1", etc. since TABLE_MAP doesn't provide column names.
+    /// If resolved_columns is provided, uses actual column names and resolves
+    /// enum/set integer values to their string labels.
+    /// Otherwise, falls back to positional names "c0", "c1", etc.
     /// Returns a slice valid until the next call to serialize.
     pub fn serialize(self: *RowJsonSerializer, values: []const event_parser.RowValue) ![]const u8 {
+        return self.serializeWithColumns(values, null);
+    }
+
+    /// Serialize with optional column info for named columns and enum/set resolution.
+    pub fn serializeWithColumns(self: *RowJsonSerializer, values: []const event_parser.RowValue, columns: ?[]const ColumnInfo) ![]const u8 {
         // Try scratch buffer first
         var fbw = FixedBufWriter{ .buf = &self.scratch };
 
-        if (self.writeJson(&fbw, values)) {
+        if (self.writeJson(&fbw, values, columns)) {
             return fbw.getWritten();
         } else |_| {
             // Overflow: use ArrayList
             self.overflow.clearRetainingCapacity();
             var alw = ArrayListWriter.init(&self.overflow, self.allocator);
-            try self.writeJson(&alw, values);
+            try self.writeJson(&alw, values, columns);
             return self.overflow.items;
         }
     }
 
-    fn writeJson(self: *RowJsonSerializer, writer: anytype, values: []const event_parser.RowValue) !void {
-        _ = self;
+    fn writeJson(self: *RowJsonSerializer, writer: anytype, values: []const event_parser.RowValue, columns: ?[]const ColumnInfo) !void {
         try writer.writeByte('{');
 
         var first = true;
@@ -78,14 +86,69 @@ pub const RowJsonSerializer = struct {
             if (!first) try writer.writeAll(",");
             first = false;
 
-            // Write key
-            try writer.print("\"c{d}\":", .{i});
+            // Write key: use column name if available, otherwise positional
+            if (columns) |cols| {
+                if (i < cols.len) {
+                    try writer.writeByte('"');
+                    try writer.writeAll(cols[i].column_name);
+                    try writer.writeAll("\":");
+                } else {
+                    try writer.print("\"c{d}\":", .{i});
+                }
+            } else {
+                try writer.print("\"c{d}\":", .{i});
+            }
 
-            // Write value
+            // Write value with enum/set resolution if available
+            if (columns) |cols| {
+                if (i < cols.len) {
+                    if (try self.writeResolvedValue(writer, value, cols[i])) continue;
+                }
+            }
             try writeValue(writer, value);
         }
 
         try writer.writeByte('}');
+    }
+
+    /// Try to resolve enum/set values. Returns true if the value was written.
+    fn writeResolvedValue(self: *RowJsonSerializer, writer: anytype, value: event_parser.RowValue, col: ColumnInfo) !bool {
+        // Only resolve integer types that might be enum/set
+        const int_val: i64 = switch (value) {
+            .tiny => |v| v,
+            .short => |v| v,
+            .long => |v| v,
+            .longlong => |v| v,
+            else => return false,
+        };
+
+        // Guard against negative values (corrupted data or unsigned interpretation)
+        if (int_val < 0) return false;
+
+        // Check if this column is an enum or set type
+        const def = schema_cache_mod.parseEnumSetDef(self.allocator, col.column_type) catch return false;
+        if (def == null) return false;
+        defer schema_cache_mod.freeEnumSetDef(self.allocator, def.?);
+
+        switch (def.?) {
+            .enum_def => |members| {
+                if (schema_cache_mod.resolveEnumValue(members, int_val)) |label| {
+                    try writer.writeByte('"');
+                    try writer.writeAll(label);
+                    try writer.writeByte('"');
+                    return true;
+                }
+            },
+            .set_def => |members| {
+                const result = schema_cache_mod.resolveSetValue(self.allocator, members, int_val) catch return false;
+                defer self.allocator.free(result);
+                try writer.writeByte('"');
+                try writer.writeAll(result);
+                try writer.writeByte('"');
+                return true;
+            },
+        }
+        return false;
     }
 
     fn writeValue(writer: anytype, value: event_parser.RowValue) !void {

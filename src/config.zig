@@ -119,6 +119,9 @@ pub const Config = struct {
     include: ?[]const []const u8 = null,
     exclude: ?[]const []const u8 = null,
 
+    // === Schema Cache Settings ===
+    schema_cache_dir: ?[]const u8 = null,
+
     // === SSL/TLS Settings ===
     ssl: bool = true,
 

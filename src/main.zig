@@ -35,6 +35,9 @@ const pipeline_mod = @import("pipeline.zig");
 const event_parser = @import("event_parser.zig");
 const log_config = @import("log_config.zig");
 
+const schema_cache_mod = @import("schema_cache.zig");
+const cache_persistence = @import("cache_persistence.zig");
+
 const log = std.log.scoped(.main);
 
 /// Install custom log function with runtime level filtering.
@@ -52,7 +55,24 @@ fn dupeRowEventForPipeline(
     re: event_parser.RowEvent,
     meta: event_parser.TableMetadata,
     event_row_index: u64,
+    resolved_columns: ?[]const schema_cache_mod.ColumnInfo,
 ) !pipeline_mod.PipelineMessage {
+    // Dupe resolved columns if available
+    var duped_cols: ?[]schema_cache_mod.ColumnInfo = null;
+    if (resolved_columns) |cols| {
+        const duped = try alloc.alloc(schema_cache_mod.ColumnInfo, cols.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (duped[0..initialized]) |*c| c.deinit(alloc);
+            alloc.free(duped);
+        }
+        for (cols) |*col| {
+            duped[initialized] = try col.dupe(alloc);
+            initialized += 1;
+        }
+        duped_cols = duped;
+    }
+
     return .{ .row_event = .{
         .timestamp = @intCast(ev.timestamp),
         .server_id = ev.server_id,
@@ -63,6 +83,7 @@ fn dupeRowEventForPipeline(
         .dml_type = re.dml_type,
         .before_values = try dupeRowValues(alloc, re.before_values),
         .after_values = try dupeRowValues(alloc, re.after_values),
+        .resolved_columns = duped_cols,
         .allocator = alloc,
     } };
 }
@@ -84,7 +105,7 @@ fn dupeRowValues(alloc: std.mem.Allocator, values: ?[]const event_parser.RowValu
 
 pub fn main(init: std.process.Init) !void {
     // Set up allocator with arena for config memory
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
@@ -172,10 +193,37 @@ pub fn main(init: std.process.Init) !void {
     };
     log.debug("connection is alive", .{});
 
+    // Create secondary connection for DESCRIBE queries (column name resolution)
+    var describe_conn_opt: ?connection.Connection = blk: {
+        log.info("opening secondary connection for schema queries", .{});
+        break :blk connection.Connection.connect(
+            allocator,
+            config.host,
+            config.port,
+            config.user,
+            config.password,
+            config.database,
+            config.ssl,
+        ) catch |err| {
+            log.warn("secondary connection failed: {}, column names will not be available", .{err});
+            break :blk null;
+        };
+    };
+    defer if (describe_conn_opt) |*dc| dc.disconnect();
+
     // Initialize binlog reader with connection and config
     log.info("starting binlog reader", .{});
-    var reader = try binlog_reader.BinlogReader.init(allocator, &conn, config);
+    const describe_conn_ptr: ?*connection.Connection = if (describe_conn_opt) |*dc| dc else null;
+    var reader = try binlog_reader.BinlogReader.init(allocator, &conn, config, describe_conn_ptr);
     defer reader.deinit();
+
+    // Load schema cache from disk if configured
+    if (config.schema_cache_dir) |cache_dir| {
+        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, cache_dir) catch 0;
+        if (loaded > 0) {
+            log.info("loaded {d} table schemas from cache", .{loaded});
+        }
+    }
 
     // Log table filter summary
     if (reader.table_filter) |*filter| {
@@ -237,6 +285,7 @@ pub fn main(init: std.process.Init) !void {
                                     row_event,
                                     row_data.table_metadata,
                                     row_idx + 1,
+                                    row_data.resolved_columns,
                                 ) catch |err| {
                                     log.err("failed to dupe row event: {}", .{err});
                                     continue;
@@ -289,6 +338,17 @@ pub fn main(init: std.process.Init) !void {
             const metrics = pipe.join();
             metrics.printSummary();
         },
+    }
+
+    // Save schema cache before shutdown
+    if (config.schema_cache_dir) |cache_dir| {
+        if (reader.schema_cache.count() > 0) {
+            if (cache_persistence.saveCache(allocator, &reader.schema_cache, cache_dir)) |path| {
+                allocator.free(path);
+            } else |err| {
+                log.warn("failed to save schema cache: {}", .{err});
+            }
+        }
     }
 
     // Summary

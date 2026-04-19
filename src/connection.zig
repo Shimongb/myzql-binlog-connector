@@ -1,8 +1,7 @@
 //! MySQL Connection Management
 //!
 //! This module handles establishing and managing MySQL connections.
-//! It resolves hostnames via dns.zig (literal IP, /etc/hosts, DNS query)
-//! and wraps the MySQL protocol implementation in src/mysql/.
+//! It wraps the MySQL protocol implementation in src/mysql/.
 
 const std = @import("std");
 const posix = std.posix;
@@ -85,6 +84,12 @@ pub const Connection = struct {
     /// Execute a SQL query (no result set expected)
     pub fn executeQuery(self: *Connection, sql: []const u8) !void {
         _ = try self.conn.query(sql);
+    }
+
+    /// Execute a SQL query that returns rows (text protocol result set).
+    /// Returns rows with string values. Caller must call deinit() on the result.
+    pub fn queryRows(self: *Connection, sql: []const u8) !mysql.conn.Conn.TextResultSet {
+        return try self.conn.queryRows(self.allocator, sql);
     }
 
     /// Get last error information

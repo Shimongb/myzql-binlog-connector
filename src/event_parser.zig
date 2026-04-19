@@ -1158,6 +1158,7 @@ pub fn shouldProcessEvent(event_type: EventType) bool {
         .ROTATE_EVENT,
         .FORMAT_DESCRIPTION_EVENT, // Need for post_header_len info
         .TABLE_MAP_EVENT, // Need to process for metadata
+        .QUERY_EVENT, // Need to process for DDL detection
         .WRITE_ROWS_EVENT_V0,
         .WRITE_ROWS_EVENT,
         .UPDATE_ROWS_EVENT_V0,

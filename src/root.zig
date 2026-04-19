@@ -12,8 +12,18 @@ const std = @import("std");
 // pub const config = @import("config.zig");
 // pub const connection = @import("connection.zig");
 // pub const binlog = @import("binlog_reader.zig");
+pub const schema_cache = @import("schema_cache.zig");
+pub const ddl_handler = @import("ddl_handler.zig");
+pub const cache_persistence = @import("cache_persistence.zig");
 
 test "root module" {
     // Placeholder test
     try std.testing.expect(true);
+}
+
+// Pull in tests from submodules
+comptime {
+    _ = schema_cache;
+    _ = ddl_handler;
+    _ = cache_persistence;
 }
