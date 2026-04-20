@@ -18,6 +18,8 @@ const metrics = @import("metrics.zig");
 const PipelineMetrics = metrics.PipelineMetrics;
 const schema_cache_mod = @import("schema_cache.zig");
 const ColumnInfo = schema_cache_mod.ColumnInfo;
+const config_mod = @import("config.zig");
+const BooleanEncoding = config_mod.BooleanEncoding;
 
 const log = std.log.scoped(.pipeline);
 
@@ -196,6 +198,7 @@ pub const Pipeline = struct {
     current_binlog_file: []const u8,
     processing_metrics: PipelineMetrics,
     flush_metrics: PipelineMetrics,
+    boolean_encoding: BooleanEncoding,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -203,6 +206,7 @@ pub const Pipeline = struct {
         initial_binlog_file: []const u8,
         batch_size: usize,
         event_queue_capacity: usize,
+        boolean_encoding: BooleanEncoding,
     ) !*Pipeline {
         const self = try allocator.create(Pipeline);
         errdefer allocator.destroy(self);
@@ -218,6 +222,7 @@ pub const Pipeline = struct {
             .current_binlog_file = try allocator.dupe(u8, initial_binlog_file),
             .processing_metrics = .{},
             .flush_metrics = .{},
+            .boolean_encoding = boolean_encoding,
         };
 
         // Ensure output directory exists
@@ -268,7 +273,7 @@ pub const Pipeline = struct {
     }
 
     fn processingWorker(self: *Pipeline) void {
-        var serializer = RowJsonSerializer.init(self.allocator);
+        var serializer = RowJsonSerializer.init(self.allocator, self.boolean_encoding);
         defer serializer.deinit();
 
         var current_batch: ?*ColumnBatch = ColumnBatch.init(self.allocator, self.batch_size) catch {

@@ -40,6 +40,22 @@ pub const OutputMode = enum {
     parquet,
 };
 
+/// How to serialize MySQL's boolean-ish column types (tinyint(1) / bit(1))
+/// in the before/after JSON that lands in Parquet.
+///
+/// - auto_bool (default): tinyint(1) and bit(1) → `true` / `false`
+/// - auto_int:            tinyint(1) stays integer (unchanged); bit(1) → 1 / 0 integer
+/// - raw:                 preserve legacy behavior — bit columns serialize as hex strings ("0x01")
+///
+/// Only columns whose DESCRIBE-reported type is exactly `tinyint(1)` (optionally
+/// followed by ` unsigned`) or `bit(1)` are coerced. Wider tinyint/bit columns
+/// are left alone so non-boolean values aren't misrepresented.
+pub const BooleanEncoding = enum {
+    auto_bool,
+    auto_int,
+    raw,
+};
+
 /// Log level (maps to std.log.Level at runtime)
 pub const LogLevel = enum {
     debug,
@@ -113,6 +129,7 @@ pub const Config = struct {
     parquet_output_dir: ?[]const u8 = null,
     parquet_batch_size: u32 = 8192,
     pipeline_queue_capacity: u32 = 32,
+    boolean_encoding: BooleanEncoding = .auto_bool,
 
     // === Table Filter Settings ===
     // Patterns: "schema.table", "schema.*", "*.table"
@@ -292,10 +309,11 @@ pub const Config = struct {
 
         log.info("output mode: {s}", .{@tagName(self.output_mode)});
         if (self.output_mode == .parquet) {
-            log.info("parquet: dir={s} batch_size={d} queue_capacity={d}", .{
+            log.info("parquet: dir={s} batch_size={d} queue_capacity={d} boolean_encoding={s}", .{
                 self.parquet_output_dir orelse "(default)",
                 self.parquet_batch_size,
                 self.pipeline_queue_capacity,
+                @tagName(self.boolean_encoding),
             });
         }
 
