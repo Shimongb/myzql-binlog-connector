@@ -8,6 +8,8 @@ const event_parser = @import("event_parser.zig");
 const ArrayListWriter = @import("array_writer.zig").ArrayListWriter;
 const schema_cache_mod = @import("schema_cache.zig");
 const ColumnInfo = schema_cache_mod.ColumnInfo;
+const config_mod = @import("config.zig");
+pub const BooleanEncoding = config_mod.BooleanEncoding;
 
 /// A simple writer that writes to a fixed buffer, returning error.NoSpaceLeft on overflow.
 const FixedBufWriter = struct {
@@ -41,11 +43,13 @@ pub const RowJsonSerializer = struct {
     scratch: [8192]u8 = undefined,
     overflow: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    boolean_encoding: BooleanEncoding,
 
-    pub fn init(allocator: std.mem.Allocator) RowJsonSerializer {
+    pub fn init(allocator: std.mem.Allocator, boolean_encoding: BooleanEncoding) RowJsonSerializer {
         return .{
             .overflow = .empty,
             .allocator = allocator,
+            .boolean_encoding = boolean_encoding,
         };
     }
 
@@ -113,6 +117,35 @@ pub const RowJsonSerializer = struct {
 
     /// Try to resolve enum/set values. Returns true if the value was written.
     fn writeResolvedValue(self: *RowJsonSerializer, writer: anytype, value: event_parser.RowValue, col: ColumnInfo) !bool {
+        // Boolean coercion for MySQL's canonical BOOL signals:
+        //   - tinyint(1): BOOL/BOOLEAN are SQL-level aliases for this exact type.
+        //                 MySQL 8.0.17+ retains the (1) display width specifically
+        //                 to convey boolean intent after removing it for other widths.
+        //   - bit(1): literally a 1-bit value, stored as a single byte.
+        //
+        // Wider tinyint(N)/bit(N) are deliberately left alone so non-boolean
+        // integers aren't misrepresented as true/false.
+        if (self.boolean_encoding != .raw) {
+            if (columnTypeIsBool1(col.column_type)) {
+                const truthy: ?bool = switch (value) {
+                    .tiny => |v| v != 0,
+                    .blob => |b| blk: {
+                        for (b) |byte| if (byte != 0) break :blk true;
+                        break :blk false;
+                    },
+                    else => null,
+                };
+                if (truthy) |t| {
+                    switch (self.boolean_encoding) {
+                        .auto_bool => try writer.writeAll(if (t) "true" else "false"),
+                        .auto_int => try writer.writeAll(if (t) "1" else "0"),
+                        .raw => unreachable,
+                    }
+                    return true;
+                }
+            }
+        }
+
         // Only resolve integer types that might be enum/set
         const int_val: i64 = switch (value) {
             .tiny => |v| v,
@@ -149,6 +182,20 @@ pub const RowJsonSerializer = struct {
             },
         }
         return false;
+    }
+
+    /// Matches `tinyint(1)` (optionally followed by ` unsigned` / ` zerofill`)
+    /// and `bit(1)` — the two MySQL column types that canonically mean BOOL.
+    /// Deliberately does NOT match `tinyint(10)`, `tinyint(11)`, etc.
+    fn columnTypeIsBool1(column_type: []const u8) bool {
+        const tinyint1 = "tinyint(1)";
+        const bit1 = "bit(1)";
+        if (std.mem.startsWith(u8, column_type, tinyint1)) {
+            if (column_type.len == tinyint1.len) return true;
+            // Accept trailing modifiers like " unsigned" but reject "tinyint(10)"
+            return column_type[tinyint1.len] == ' ';
+        }
+        return std.mem.eql(u8, column_type, bit1);
     }
 
     fn writeValue(writer: anytype, value: event_parser.RowValue) !void {
@@ -299,7 +346,7 @@ pub const RowJsonSerializer = struct {
 };
 
 test "serialize null values" {
-    var s = RowJsonSerializer.init(std.testing.allocator);
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
     defer s.deinit();
 
     const values = [_]event_parser.RowValue{.null_value};
@@ -308,7 +355,7 @@ test "serialize null values" {
 }
 
 test "serialize integer values" {
-    var s = RowJsonSerializer.init(std.testing.allocator);
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
     defer s.deinit();
 
     const values = [_]event_parser.RowValue{
@@ -321,7 +368,7 @@ test "serialize integer values" {
 }
 
 test "serialize string with escaping" {
-    var s = RowJsonSerializer.init(std.testing.allocator);
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
     defer s.deinit();
 
     const values = [_]event_parser.RowValue{
@@ -332,7 +379,7 @@ test "serialize string with escaping" {
 }
 
 test "serialize json passthrough" {
-    var s = RowJsonSerializer.init(std.testing.allocator);
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
     defer s.deinit();
 
     const values = [_]event_parser.RowValue{
@@ -340,4 +387,106 @@ test "serialize json passthrough" {
     };
     const result = try s.serialize(&values);
     try std.testing.expectEqualStrings("{\"c0\":{\"key\":true}}", result);
+}
+
+fn makeBoolCol(name: []const u8, column_type: []const u8) ColumnInfo {
+    return .{
+        .column_name = name,
+        .column_type = column_type,
+        .is_nullable = true,
+        .column_key = "",
+        .column_default = null,
+        .column_extra = "",
+        .ordinal_position = 1,
+    };
+}
+
+test "bool coercion: tinyint(1) auto_bool" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{
+        makeBoolCol("is_foo", "tinyint(1)"),
+        makeBoolCol("is_bar", "tinyint(1)"),
+        makeBoolCol("is_baz", "tinyint(1) unsigned"),
+    };
+    const values = [_]event_parser.RowValue{
+        .{ .tiny = 0 },
+        .{ .tiny = 1 },
+        .{ .tiny = 42 }, // any non-zero is true
+    };
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings(
+        "{\"is_foo\":false,\"is_bar\":true,\"is_baz\":true}",
+        result,
+    );
+}
+
+test "bool coercion: bit(1) auto_bool" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{
+        makeBoolCol("a", "bit(1)"),
+        makeBoolCol("b", "bit(1)"),
+    };
+    const values = [_]event_parser.RowValue{
+        .{ .blob = &[_]u8{0x00} },
+        .{ .blob = &[_]u8{0x01} },
+    };
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"a\":false,\"b\":true}", result);
+}
+
+test "bool coercion: auto_int emits 1/0 for bit(1) and tinyint(1)" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_int);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{
+        makeBoolCol("ti", "tinyint(1)"),
+        makeBoolCol("bi", "bit(1)"),
+    };
+    const values = [_]event_parser.RowValue{
+        .{ .tiny = 0 },
+        .{ .blob = &[_]u8{0x01} },
+    };
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"ti\":0,\"bi\":1}", result);
+}
+
+test "bool coercion: raw mode preserves legacy hex blob for bit(1)" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .raw);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeBoolCol("a", "bit(1)")};
+    const values = [_]event_parser.RowValue{.{ .blob = &[_]u8{0x01} }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"a\":\"0x01\"}", result);
+}
+
+test "bool coercion: wider types are NOT coerced" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{
+        makeBoolCol("flags", "tinyint(4)"), // display width != 1 → not boolean
+        makeBoolCol("mask", "bit(8)"),      // bit(N>1) → not boolean
+    };
+    const values = [_]event_parser.RowValue{
+        .{ .tiny = 5 },
+        .{ .blob = &[_]u8{0x05} },
+    };
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"flags\":5,\"mask\":\"0x05\"}", result);
+}
+
+test "bool coercion: tinyint(10) must not match tinyint(1) prefix" {
+    // Regression guard: a naive startsWith(\"tinyint(1)\") would eat tinyint(10).
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeBoolCol("n", "tinyint(10)")};
+    const values = [_]event_parser.RowValue{.{ .tiny = 7 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"n\":7}", result);
 }

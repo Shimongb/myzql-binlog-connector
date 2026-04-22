@@ -255,6 +255,7 @@ pub fn main(init: std.process.Init) !void {
                 config.from_binlog_file,
                 config.parquet_batch_size,
                 config.pipeline_queue_capacity,
+                config.boolean_encoding,
             ) catch |err| {
                 log.err("failed to initialize pipeline: {}", .{err});
                 return err;
