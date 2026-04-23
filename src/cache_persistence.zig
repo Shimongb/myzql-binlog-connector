@@ -14,17 +14,24 @@ const ColumnInfo = schema_cache_mod.ColumnInfo;
 
 const log = std.log.scoped(.cache_persistence);
 
-const CACHE_VERSION: u32 = 1;
+/// Bumped from 1 → 2 when `saved_at_unix` was added to the top-level JSON.
+/// v1 files are rejected by `deserializeCacheFromJson` (logged and skipped).
+const CACHE_VERSION: u32 = 2;
 
 /// Save the schema cache to a JSON file in the given directory.
 /// Returns the filename used (content-addressable).
-pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const u8) ![]const u8 {
-    // Serialize to JSON
-    const json_data = try serializeCacheToJson(allocator, cache);
-    defer allocator.free(json_data);
+///
+/// Filename hash is computed over the stable body (version + schemas)
+/// only — `saved_at_unix` is wrapped on top for disk writes but excluded
+/// from the hash so identical schemas produce identical filenames across
+/// runs, enabling deduplication and predictable cleanup.
+pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const u8, io: std.Io) ![]const u8 {
+    // Serialize the stable (hashable) body.
+    const stable_json = try serializeCacheToJson(allocator, cache);
+    defer allocator.free(stable_json);
 
-    // Compute checksum
-    const checksum = computeChecksum(json_data);
+    // Checksum over the stable body only.
+    const checksum = computeChecksum(stable_json);
     var checksum_hex: [16]u8 = undefined;
     const hex_chars = "0123456789abcdef";
     for (checksum[0..8], 0..) |byte, i| {
@@ -32,8 +39,17 @@ pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const
         checksum_hex[i * 2 + 1] = hex_chars[byte & 0x0f];
     }
 
-    // Build full path
-    const full_path = try std.fmt.allocPrint(allocator, "{s}/schema_cache_{s}.json", .{ dir, checksum_hex });
+    // Wrap with saved_at_unix for the on-disk payload, then gzip.
+    const now_ts = std.Io.Clock.now(.real, io);
+    const now_secs: i64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
+    const disk_json = try wrapWithSavedAt(allocator, stable_json, now_secs);
+    defer allocator.free(disk_json);
+    const disk_payload = try gzipCompress(allocator, disk_json);
+    defer allocator.free(disk_payload);
+
+    // Build full path — gzipped JSON going forward. Plain `.json` files
+    // from older runs remain readable (magic-byte detection in loader).
+    const full_path = try std.fmt.allocPrint(allocator, "{s}/schema_cache_{s}.json.gz", .{ dir, checksum_hex });
     errdefer allocator.free(full_path);
 
     // Ensure directory exists (best-effort mkdir -p via posix)
@@ -54,8 +70,8 @@ pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const
     defer _ = std.posix.system.close(fd);
 
     var written: usize = 0;
-    while (written < json_data.len) {
-        const rc = std.posix.system.write(fd, json_data[written..].ptr, json_data[written..].len);
+    while (written < disk_payload.len) {
+        const rc = std.posix.system.write(fd, disk_payload[written..].ptr, disk_payload[written..].len);
         const signed_rc: isize = @bitCast(rc);
         if (signed_rc < 0) {
             log.err("failed to write cache file", .{});
@@ -81,9 +97,92 @@ pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const
     defer _ = std.posix.system.close(latest_fd);
     _ = std.posix.system.write(latest_fd, full_path.ptr, full_path.len);
 
-    log.info("schema cache saved: {s} ({d} bytes, {d} tables)", .{ full_path, json_data.len, cache.count() });
+    log.info("schema cache saved: {s} ({d} bytes gzip / {d} bytes raw, {d} tables)", .{ full_path, disk_payload.len, disk_json.len, cache.count() });
+
+    // Best-effort cleanup of older content-addressable files. Runs AFTER
+    // the new file + latest pointer are durably written, so a crash here
+    // never leaves us without a usable cache.
+    pruneOldCacheFiles(allocator, dir, DEFAULT_KEEP_N, io);
 
     return full_path;
+}
+
+/// How many historical cache files to retain per directory.
+/// The most recent N (by mtime) survive a prune pass; the rest are
+/// deleted. The file currently referenced by `.schema_cache_latest` is
+/// additionally protected as a belt-and-suspenders guard.
+const DEFAULT_KEEP_N: usize = 3;
+
+/// Delete stale `schema_cache_*.json(.gz)` files in `dir`, keeping the
+/// `keep_n` most recently modified and always preserving the file
+/// referenced by `.schema_cache_latest`.
+///
+/// Best-effort: all errors are logged at debug level and swallowed, since
+/// failing to prune old files must never break a successful save.
+pub fn pruneOldCacheFiles(allocator: std.mem.Allocator, dir: []const u8, keep_n: usize, io: std.Io) void {
+    var dir_handle = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |err| {
+        log.debug("prune: couldn't open cache dir '{s}': {}", .{ dir, err });
+        return;
+    };
+    defer dir_handle.close(io);
+
+    const CacheFile = struct {
+        name: []u8,
+        mtime_ns: i96,
+    };
+
+    var files: std.ArrayList(CacheFile) = .empty;
+    defer {
+        for (files.items) |f| allocator.free(f.name);
+        files.deinit(allocator);
+    }
+
+    var iter = dir_handle.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "schema_cache_")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json") and
+            !std.mem.endsWith(u8, entry.name, ".json.gz")) continue;
+
+        const stat = dir_handle.statFile(io, entry.name, .{}) catch continue;
+
+        const name_dup = allocator.dupe(u8, entry.name) catch continue;
+        files.append(allocator, .{ .name = name_dup, .mtime_ns = stat.mtime.nanoseconds }) catch {
+            allocator.free(name_dup);
+            continue;
+        };
+    }
+
+    if (files.items.len <= keep_n) return;
+
+    std.mem.sort(CacheFile, files.items, {}, struct {
+        fn lt(_: void, a: CacheFile, b: CacheFile) bool {
+            return a.mtime_ns > b.mtime_ns; // newest first
+        }
+    }.lt);
+
+    const latest_path_opt = readLatestPointer(allocator, dir) catch null;
+    defer if (latest_path_opt) |p| allocator.free(p);
+    const latest_basename: ?[]const u8 = if (latest_path_opt) |p|
+        std.fs.path.basename(p)
+    else
+        null;
+
+    var deleted: usize = 0;
+    for (files.items[keep_n..]) |f| {
+        if (latest_basename) |lb| {
+            if (std.mem.eql(u8, f.name, lb)) continue;
+        }
+        dir_handle.deleteFile(io, f.name) catch |err| {
+            log.debug("prune: failed to delete '{s}': {}", .{ f.name, err });
+            continue;
+        };
+        deleted += 1;
+    }
+
+    if (deleted > 0) {
+        log.info("prune: removed {d} stale schema cache file(s) from '{s}'", .{ deleted, dir });
+    }
 }
 
 /// Load the schema cache from a specific file path.
@@ -125,7 +224,21 @@ pub fn loadCacheFromFile(allocator: std.mem.Allocator, cache: *SchemaCache, path
         total_read += n;
     }
 
-    const tables_loaded = deserializeCacheFromJson(allocator, cache, json_data[0..total_read]) catch |err| {
+    const raw_bytes = json_data[0..total_read];
+    // Detect on-disk compression via magic bytes rather than filename so
+    // that moving/renaming files (or legacy plain `.json` files written
+    // before gzip landed) still round-trip correctly.
+    var decoded: ?[]u8 = null;
+    defer if (decoded) |d| allocator.free(d);
+    const body: []const u8 = if (looksLikeGzip(raw_bytes)) blk: {
+        decoded = gzipDecompress(allocator, raw_bytes) catch |err| {
+            log.warn("gzip decompress failed for '{s}': {}", .{ path, err });
+            return 0;
+        };
+        break :blk decoded.?;
+    } else raw_bytes;
+
+    const tables_loaded = deserializeCacheFromJson(allocator, cache, body) catch |err| {
         log.warn("failed to deserialize cache from '{s}': {}", .{ path, err });
         return 0;
     };
@@ -136,28 +249,86 @@ pub fn loadCacheFromFile(allocator: std.mem.Allocator, cache: *SchemaCache, path
 
 /// Load the most recent schema cache from the given directory.
 /// Reads the `.schema_cache_latest` pointer file to find the cache file.
-pub fn loadCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const u8) !usize {
-    // Read the pointer file
+/// `ttl_seconds` (opt-in): if non-null, the file's storage-layer mtime is
+/// checked at bootstrap; anything older than `now - ttl` is treated as
+/// stale and skipped (caller proceeds as a cold run). Null disables the
+/// check.
+pub fn loadCache(
+    allocator: std.mem.Allocator,
+    cache: *SchemaCache,
+    dir: []const u8,
+    ttl_seconds: ?u64,
+    io: std.Io,
+) !usize {
+    const cache_path = (try readLatestPointer(allocator, dir)) orelse {
+        log.debug("no .schema_cache_latest in '{s}'", .{dir});
+        return 0;
+    };
+    defer allocator.free(cache_path);
+
+    // Staleness check — bootstrap-only. Uses storage-layer mtime so a
+    // future S3 backend can answer the question with HEAD alone, no GET.
+    if (ttl_seconds) |ttl| {
+        if (try getFileMtime(io, cache_path)) |mtime| {
+            const now_ts = std.Io.Clock.now(.real, io);
+            const now: i64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
+            if (isStaleByTtl(mtime, now, ttl)) {
+                log.warn(
+                    "schema cache '{s}' is stale (age {d}s, TTL {d}s); cold-starting",
+                    .{ cache_path, now - mtime, ttl },
+                );
+                return 0;
+            }
+        } else {
+            // Backend didn't report mtime. Fallback path (saved_at_unix
+            // inside the JSON) isn't wired up yet — see item 4 in
+            // ROADMAP_COLUMN_AWARENESS.md. For now we accept the cache
+            // rather than forcing a cold start on every run.
+            log.debug("cache mtime unavailable; TTL check skipped for '{s}'", .{cache_path});
+        }
+    }
+
+    return try loadCacheFromFile(allocator, cache, cache_path);
+}
+
+/// Read `.schema_cache_latest` and return the cache file path it points
+/// to. Caller owns the returned slice. Returns null if the pointer file
+/// is missing or empty.
+fn readLatestPointer(allocator: std.mem.Allocator, dir: []const u8) !?[]u8 {
     const latest_path = try std.fmt.allocPrint(allocator, "{s}/.schema_cache_latest", .{dir});
     defer allocator.free(latest_path);
 
     const latest_z = try allocator.dupeZ(u8, latest_path);
     defer allocator.free(latest_z);
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, latest_z, .{}, 0) catch {
-        log.debug("no .schema_cache_latest in '{s}'", .{dir});
-        return 0;
-    };
+    const fd = std.posix.openat(std.posix.AT.FDCWD, latest_z, .{}, 0) catch return null;
     defer _ = std.posix.system.close(fd);
 
     var path_buf: [4096]u8 = undefined;
-    const n = std.posix.read(fd, &path_buf) catch return 0;
-    if (n == 0) return 0;
+    const n = std.posix.read(fd, &path_buf) catch return null;
+    if (n == 0) return null;
 
-    const cache_path = std.mem.trim(u8, path_buf[0..n], "\n\r \t");
-    if (cache_path.len == 0) return 0;
+    const trimmed = std.mem.trim(u8, path_buf[0..n], "\n\r \t");
+    if (trimmed.len == 0) return null;
 
-    return try loadCacheFromFile(allocator, cache, cache_path);
+    return try allocator.dupe(u8, trimmed);
+}
+
+/// Return the mtime (Unix seconds) of the file at `path`, or null if it
+/// can't be determined. Isolated helper so a future S3 backend can swap
+/// in a HEAD-based implementation without touching the TTL check itself.
+fn getFileMtime(io: std.Io, path: []const u8) !?i64 {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    // stat.mtime.nanoseconds is i96 nanoseconds since the Unix epoch.
+    return @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
+}
+
+/// Pure predicate — exposed for unit testing. `mtime` and `now` are Unix
+/// seconds; returns true if the cache should be treated as stale.
+pub fn isStaleByTtl(mtime: i64, now: i64, ttl_seconds: u64) bool {
+    if (now <= mtime) return false; // clock skew: trust the cache
+    const age: u64 = @intCast(now - mtime);
+    return age > ttl_seconds;
 }
 
 /// Best-effort mkdir -p using posix.
@@ -177,6 +348,9 @@ fn serializeCacheToJson(allocator: std.mem.Allocator, cache: *SchemaCache) ![]co
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
+    // Stable body — version + schemas only. `saved_at_unix` is wrapped on
+    // top at write time by `wrapWithSavedAt`, so the content-addressable
+    // checksum doesn't churn every save when schemas are unchanged.
     try buf.appendSlice(allocator, "{\"version\":");
     try appendInt(&buf, allocator, CACHE_VERSION);
     try buf.appendSlice(allocator, ",\"schemas\":{");
@@ -298,7 +472,7 @@ fn deserializeCacheFromJson(allocator: std.mem.Allocator, cache: *SchemaCache, j
                 allocator.free(cols);
             }
             for (json_cols) |jc| {
-                cols[initialized] = .{
+                var col: ColumnInfo = .{
                     .column_name = try allocator.dupe(u8, jc.column_name),
                     .column_type = try allocator.dupe(u8, jc.column_type),
                     .is_nullable = jc.is_nullable,
@@ -307,6 +481,9 @@ fn deserializeCacheFromJson(allocator: std.mem.Allocator, cache: *SchemaCache, j
                     .column_extra = try allocator.dupe(u8, jc.column_extra),
                     .ordinal_position = jc.ordinal_position,
                 };
+                errdefer col.deinit(allocator);
+                try col.refreshParsedEnumSet(allocator);
+                cols[initialized] = col;
                 initialized += 1;
             }
             resolved = cols;
@@ -322,6 +499,63 @@ fn deserializeCacheFromJson(allocator: std.mem.Allocator, cache: *SchemaCache, j
     }
 
     return count;
+}
+
+/// Gzip-compress `data`. Caller owns the returned slice.
+fn gzipCompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, data.len / 2 + 1024);
+    errdefer output.deinit();
+
+    var compress_window: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(
+        &output.writer,
+        &compress_window,
+        .gzip,
+        .default,
+    );
+    // See parquet_writer.zig for the rationale on `finish` vs `flush`:
+    // `flush` produces truncated streams that downstream readers reject.
+    try compressor.writer.writeAll(data);
+    try compressor.finish();
+
+    return try output.toOwnedSlice();
+}
+
+/// Gzip-decompress `data`. Caller owns the returned slice. Caller should
+/// pre-verify the gzip magic (`1f 8b`) at `data[0..2]`.
+fn gzipDecompress(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var input_reader: std.Io.Reader = .fixed(data);
+    var decompress_window: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompressor: std.compress.flate.Decompress = .init(
+        &input_reader,
+        .gzip,
+        &decompress_window,
+    );
+    return try decompressor.reader.allocRemaining(allocator, .unlimited);
+}
+
+/// True if `data` starts with the gzip magic bytes (0x1f 0x8b).
+fn looksLikeGzip(data: []const u8) bool {
+    return data.len >= 2 and data[0] == 0x1f and data[1] == 0x8b;
+}
+
+/// Wrap a stable cache body with the current `saved_at_unix` timestamp.
+/// The stable body is `{"version":N,"schemas":...}`; we splice in
+/// `"saved_at_unix":T,` right after the opening brace so the final JSON
+/// is `{"saved_at_unix":T,"version":N,"schemas":...}`.
+///
+/// `saved_at_unix` is deliberately kept OUT of the stable body so the
+/// content-addressable filename hash doesn't churn on every save.
+fn wrapWithSavedAt(allocator: std.mem.Allocator, stable_body: []const u8, saved_at: i64) ![]u8 {
+    std.debug.assert(stable_body.len > 0 and stable_body[0] == '{');
+
+    const inject = try std.fmt.allocPrint(allocator, "{{\"saved_at_unix\":{d},", .{saved_at});
+    defer allocator.free(inject);
+
+    const out = try allocator.alloc(u8, inject.len + stable_body.len - 1);
+    @memcpy(out[0..inject.len], inject);
+    @memcpy(out[inject.len..], stable_body[1..]);
+    return out;
 }
 
 /// Compute SHA-256 checksum of data.
@@ -372,6 +606,10 @@ const TableSchemaJson = struct {
 
 const CacheJson = struct {
     version: u32,
+    /// Unix seconds when `saveCache` wrote this file. Fallback for
+    /// staleness checks when the storage backend can't report mtime.
+    /// Defaults to 0 when reading pre-v2 content via a compatibility path.
+    saved_at_unix: i64 = 0,
     schemas: std.json.ArrayHashMap(TableSchemaJson),
 };
 
@@ -456,4 +694,233 @@ test "computeChecksum" {
     // SHA-256 of "hello world" starts with b94d27b9...
     try std.testing.expectEqual(@as(u8, 0xb9), hash[0]);
     try std.testing.expectEqual(@as(u8, 0x4d), hash[1]);
+}
+
+test "isStaleByTtl: fresh cache is not stale" {
+    const mtime: i64 = 1_000_000_000;
+    const now: i64 = 1_000_000_060; // 60s later
+    try std.testing.expect(!isStaleByTtl(mtime, now, 3600));
+}
+
+test "isStaleByTtl: aged cache past TTL is stale" {
+    const mtime: i64 = 1_000_000_000;
+    const now: i64 = 1_000_007_200; // 2h later
+    try std.testing.expect(isStaleByTtl(mtime, now, 3600)); // 1h TTL
+}
+
+test "isStaleByTtl: exactly at TTL is NOT stale (strict > semantics)" {
+    const mtime: i64 = 1_000_000_000;
+    const now: i64 = 1_000_003_600; // +3600s
+    try std.testing.expect(!isStaleByTtl(mtime, now, 3600));
+}
+
+test "isStaleByTtl: clock skew (now < mtime) trusts the cache" {
+    const mtime: i64 = 1_000_000_100;
+    const now: i64 = 1_000_000_000;
+    try std.testing.expect(!isStaleByTtl(mtime, now, 60));
+}
+
+test "stable body excludes saved_at_unix (hash stability)" {
+    // The content-addressable filename hash is computed over the stable
+    // body. saved_at_unix MUST NOT appear there, or identical schemas
+    // would produce different filenames on every save.
+    const allocator = std.testing.allocator;
+
+    var cache = SchemaCache.init(allocator, null);
+    defer cache.deinit();
+
+    const types = try allocator.dupe(u8, &[_]u8{3});
+    const version = try allocator.dupe(u8, "binlog.000001:100");
+    try cache.put("testdb", "t1", .{
+        .columns_count = 1,
+        .columns_types = types,
+        .schema_version = version,
+        .resolved_columns = null,
+    });
+
+    const stable = try serializeCacheToJson(allocator, &cache);
+    defer allocator.free(stable);
+
+    try std.testing.expect(std.mem.indexOf(u8, stable, "\"saved_at_unix\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "\"version\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stable, "\"schemas\":") != null);
+}
+
+test "checksum is stable across saves when schemas don't change" {
+    const allocator = std.testing.allocator;
+
+    var cache = SchemaCache.init(allocator, null);
+    defer cache.deinit();
+
+    const types = try allocator.dupe(u8, &[_]u8{3});
+    const version = try allocator.dupe(u8, "binlog.000001:100");
+    try cache.put("testdb", "t1", .{
+        .columns_count = 1,
+        .columns_types = types,
+        .schema_version = version,
+        .resolved_columns = null,
+    });
+
+    const stable_a = try serializeCacheToJson(allocator, &cache);
+    defer allocator.free(stable_a);
+    const stable_b = try serializeCacheToJson(allocator, &cache);
+    defer allocator.free(stable_b);
+
+    try std.testing.expectEqualSlices(u8, stable_a, stable_b);
+    try std.testing.expectEqualSlices(u8, &computeChecksum(stable_a), &computeChecksum(stable_b));
+}
+
+test "pruneOldCacheFiles keeps the N newest and protects the latest pointer" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Create a temp dir with 5 cache files of increasing mtime.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
+    defer allocator.free(dir_path);
+
+    const names = [_][]const u8{
+        "schema_cache_aaaaaaaaaaaaaaaa.json",
+        "schema_cache_bbbbbbbbbbbbbbbb.json",
+        "schema_cache_cccccccccccccccc.json",
+        "schema_cache_dddddddddddddddd.json",
+        "schema_cache_eeeeeeeeeeeeeeee.json",
+    };
+    for (names) |n| {
+        const f = try tmp.dir.createFile(io, n, .{});
+        try f.writePositionalAll(io, "{}", 0);
+        f.close(io);
+        // Nudge mtime ordering — sleep a bit so newer files really are newer.
+        try std.Io.sleep(io, .fromMilliseconds(10), .real);
+    }
+
+    // Point `.schema_cache_latest` at the OLDEST file to verify the prune
+    // guard protects it even though it's not in the "newest N" set.
+    const latest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, names[0] });
+    defer allocator.free(latest_path);
+    const latest_file = try tmp.dir.createFile(io, ".schema_cache_latest", .{});
+    try latest_file.writePositionalAll(io, latest_path, 0);
+    latest_file.close(io);
+
+    // Keep the 2 newest; expect the 2 oldest NON-protected to be deleted.
+    pruneOldCacheFiles(allocator, dir_path, 2, io);
+
+    // The 2 newest (names[3], names[4]) must still exist.
+    _ = try tmp.dir.statFile(io, names[3], .{});
+    _ = try tmp.dir.statFile(io, names[4], .{});
+    // The protected (oldest but pointed to by latest) must still exist.
+    _ = try tmp.dir.statFile(io, names[0], .{});
+    // The middle two should be gone.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[1], .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[2], .{}));
+}
+
+test "gzip round-trip preserves JSON content" {
+    const allocator = std.testing.allocator;
+
+    const original = "{\"version\":2,\"saved_at_unix\":1000,\"schemas\":{\"db.t\":{\"columns_count\":1}}}";
+
+    const compressed = try gzipCompress(allocator, original);
+    defer allocator.free(compressed);
+
+    try std.testing.expect(looksLikeGzip(compressed));
+
+    const roundtrip = try gzipDecompress(allocator, compressed);
+    defer allocator.free(roundtrip);
+
+    try std.testing.expectEqualStrings(original, roundtrip);
+}
+
+test "looksLikeGzip accepts magic and rejects plain JSON" {
+    try std.testing.expect(looksLikeGzip(&[_]u8{ 0x1f, 0x8b, 0x08, 0x00 }));
+    try std.testing.expect(!looksLikeGzip("{\"version\":2}"));
+    try std.testing.expect(!looksLikeGzip(&[_]u8{0x1f})); // too short
+    try std.testing.expect(!looksLikeGzip(""));
+}
+
+test "loader transparently decodes gzipped payload" {
+    // End-to-end: save via saveCache (which gzips), then load via
+    // loadCache (which detects gzip via magic bytes and decompresses).
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
+    defer allocator.free(dir_path);
+
+    // Build a minimal but valid cache and save it — this exercises the
+    // gzip-write path end-to-end.
+    var cache_out = SchemaCache.init(allocator, null);
+    defer cache_out.deinit();
+    const types = try allocator.dupe(u8, &[_]u8{3});
+    const version = try allocator.dupe(u8, "binlog.000001:100");
+    try cache_out.put("testdb", "t1", .{
+        .columns_count = 1,
+        .columns_types = types,
+        .schema_version = version,
+        .resolved_columns = null,
+    });
+    const saved_path = try saveCache(allocator, &cache_out, dir_path, io);
+    defer allocator.free(saved_path);
+
+    // Filename suffix is the contract consumers rely on.
+    try std.testing.expect(std.mem.endsWith(u8, saved_path, ".json.gz"));
+
+    // Now load it back — loader must detect gzip via magic bytes and
+    // decompress. If this succeeds the on-disk payload really is gzip.
+    var cache_in = SchemaCache.init(allocator, null);
+    defer cache_in.deinit();
+    const loaded = try loadCache(allocator, &cache_in, dir_path, null, io);
+    try std.testing.expectEqual(@as(usize, 1), loaded);
+    try std.testing.expect(cache_in.get("testdb", "t1") != null);
+}
+
+test "pruneOldCacheFiles is a no-op when files <= keep_n" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
+    defer allocator.free(dir_path);
+
+    const f = try tmp.dir.createFile(io, "schema_cache_0000000000000000.json", .{});
+    try f.writePositionalAll(io, "{}", 0);
+    f.close(io);
+
+    pruneOldCacheFiles(allocator, dir_path, 3, io);
+
+    _ = try tmp.dir.statFile(io, "schema_cache_0000000000000000.json", .{});
+}
+
+test "wrapWithSavedAt injects field without disturbing schema body" {
+    const allocator = std.testing.allocator;
+
+    const stable = "{\"version\":2,\"schemas\":{}}";
+    const wrapped = try wrapWithSavedAt(allocator, stable, 1234567890);
+    defer allocator.free(wrapped);
+
+    try std.testing.expectEqualStrings(
+        "{\"saved_at_unix\":1234567890,\"version\":2,\"schemas\":{}}",
+        wrapped,
+    );
+
+    // And it must parse back cleanly through the CacheJson schema.
+    const parsed = try std.json.parseFromSlice(CacheJson, allocator, wrapped, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1234567890), parsed.value.saved_at_unix);
+    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
 }

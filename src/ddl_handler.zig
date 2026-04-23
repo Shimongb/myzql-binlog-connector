@@ -221,6 +221,7 @@ fn applyAlterTable(
                     const type_str = try datatypeToString(allocator, mc.data_type);
                     allocator.free(columns.items[i].column_type);
                     columns.items[i].column_type = type_str;
+                    try columns.items[i].refreshParsedEnumSet(allocator);
                     updateColumnOptions(&columns.items[i], mc.options);
 
                     // Handle repositioning
@@ -252,6 +253,7 @@ fn applyAlterTable(
                     const type_str = try datatypeToString(allocator, cc.data_type);
                     allocator.free(columns.items[i].column_type);
                     columns.items[i].column_type = type_str;
+                    try columns.items[i].refreshParsedEnumSet(allocator);
                     updateColumnOptions(&columns.items[i], cc.options);
 
                     // Handle repositioning
@@ -403,6 +405,9 @@ fn buildColumnInfo(allocator: std.mem.Allocator, col_def: myzqlparser.ColumnDef,
         }
     }
 
+    const parsed_def: ?schema_cache.EnumSetDef = try schema_cache.parseEnumSetDef(allocator, col_type);
+    errdefer if (parsed_def) |d| schema_cache.freeEnumSetDef(allocator, d);
+
     return .{
         .column_name = col_name,
         .column_type = col_type,
@@ -411,6 +416,7 @@ fn buildColumnInfo(allocator: std.mem.Allocator, col_def: myzqlparser.ColumnDef,
         .column_default = if (column_default) |d| try allocator.dupe(u8, d) else null,
         .column_extra = try allocator.dupe(u8, column_extra),
         .ordinal_position = ordinal,
+        .parsed_enum_set = parsed_def,
     };
 }
 
@@ -462,8 +468,19 @@ fn isTransactionControl(sql: []const u8) bool {
 /// Convert a myzqlparser DataType to a DESCRIBE-style type string.
 fn datatypeToString(allocator: std.mem.Allocator, data_type: myzqlparser.DataType) ![]const u8 {
     return switch (data_type) {
-        .tiny_int => try allocator.dupe(u8, "tinyint"),
-        .tiny_int_unsigned => try allocator.dupe(u8, "tinyint unsigned"),
+        // tinyint / bit MUST carry their display width when set — that's
+        // how `tinyint(1)` / `bit(1)` signal BOOL intent for downstream
+        // coercion in row_json_serializer (`columnTypeIsBool1`). Dropping
+        // the width here meant bool columns silently shipped as integers
+        // (regression caught by docker/integration_test.sh canary row).
+        .tiny_int => |w| if (w) |n|
+            try std.fmt.allocPrint(allocator, "tinyint({d})", .{n})
+        else
+            try allocator.dupe(u8, "tinyint"),
+        .tiny_int_unsigned => |w| if (w) |n|
+            try std.fmt.allocPrint(allocator, "tinyint({d}) unsigned", .{n})
+        else
+            try allocator.dupe(u8, "tinyint unsigned"),
         .small_int => try allocator.dupe(u8, "smallint"),
         .small_int_unsigned => try allocator.dupe(u8, "smallint unsigned"),
         .medium_int => try allocator.dupe(u8, "mediumint"),
@@ -494,7 +511,10 @@ fn datatypeToString(allocator: std.mem.Allocator, data_type: myzqlparser.DataTyp
         .medium_blob => try allocator.dupe(u8, "mediumblob"),
         .long_blob => try allocator.dupe(u8, "longblob"),
         .json => try allocator.dupe(u8, "json"),
-        .bit => try allocator.dupe(u8, "bit"),
+        .bit => |w| if (w) |n|
+            try std.fmt.allocPrint(allocator, "bit({d})", .{n})
+        else
+            try allocator.dupe(u8, "bit"),
         .@"enum" => |values| try buildEnumSetString(allocator, "enum", values),
         .set => |values| try buildEnumSetString(allocator, "set", values),
         else => try allocator.dupe(u8, "unknown"),

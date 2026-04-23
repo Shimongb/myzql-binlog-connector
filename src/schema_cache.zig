@@ -22,6 +22,10 @@ pub const ColumnInfo = struct {
     column_default: ?[]const u8,
     column_extra: []const u8, // "auto_increment", "on update CURRENT_TIMESTAMP", ""
     ordinal_position: usize, // 1-based
+    /// Parsed enum/set members, derived from `column_type` at construction
+    /// time. Populated via `refreshParsedEnumSet` so the row-serialization
+    /// hot path doesn't re-parse on every value.
+    parsed_enum_set: ?EnumSetDef = null,
 
     pub fn deinit(self: *const ColumnInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.column_name);
@@ -29,18 +33,42 @@ pub const ColumnInfo = struct {
         allocator.free(self.column_key);
         if (self.column_default) |d| allocator.free(d);
         allocator.free(self.column_extra);
+        if (self.parsed_enum_set) |def| freeEnumSetDef(allocator, def);
     }
 
     pub fn dupe(self: *const ColumnInfo, allocator: std.mem.Allocator) !ColumnInfo {
+        const name = try allocator.dupe(u8, self.column_name);
+        errdefer allocator.free(name);
+        const ctype = try allocator.dupe(u8, self.column_type);
+        errdefer allocator.free(ctype);
+        const key = try allocator.dupe(u8, self.column_key);
+        errdefer allocator.free(key);
+        const default_ = if (self.column_default) |d| try allocator.dupe(u8, d) else null;
+        errdefer if (default_) |d| allocator.free(d);
+        const extra = try allocator.dupe(u8, self.column_extra);
+        errdefer allocator.free(extra);
+        const parsed: ?EnumSetDef = if (self.parsed_enum_set) |def| try dupeEnumSetDef(allocator, def) else null;
+
         return .{
-            .column_name = try allocator.dupe(u8, self.column_name),
-            .column_type = try allocator.dupe(u8, self.column_type),
+            .column_name = name,
+            .column_type = ctype,
             .is_nullable = self.is_nullable,
-            .column_key = try allocator.dupe(u8, self.column_key),
-            .column_default = if (self.column_default) |d| try allocator.dupe(u8, d) else null,
-            .column_extra = try allocator.dupe(u8, self.column_extra),
+            .column_key = key,
+            .column_default = default_,
+            .column_extra = extra,
             .ordinal_position = self.ordinal_position,
+            .parsed_enum_set = parsed,
         };
+    }
+
+    /// Reparse `column_type` into `parsed_enum_set`, freeing any prior value.
+    /// Call this after mutating `column_type` (e.g. ALTER MODIFY/CHANGE).
+    pub fn refreshParsedEnumSet(self: *ColumnInfo, allocator: std.mem.Allocator) !void {
+        if (self.parsed_enum_set) |def| {
+            freeEnumSetDef(allocator, def);
+            self.parsed_enum_set = null;
+        }
+        self.parsed_enum_set = try parseEnumSetDef(allocator, self.column_type);
     }
 };
 
@@ -216,6 +244,28 @@ pub fn freeEnumSetDef(allocator: std.mem.Allocator, def: EnumSetDef) void {
     };
     for (vals) |v| allocator.free(v);
     allocator.free(vals);
+}
+
+/// Deep-copy an EnumSetDef (duplicating each member string).
+pub fn dupeEnumSetDef(allocator: std.mem.Allocator, def: EnumSetDef) !EnumSetDef {
+    const src_vals = switch (def) {
+        .enum_def => |v| v,
+        .set_def => |v| v,
+    };
+    const new_vals = try allocator.alloc([]const u8, src_vals.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (new_vals[0..initialized]) |v| allocator.free(v);
+        allocator.free(new_vals);
+    }
+    for (src_vals) |v| {
+        new_vals[initialized] = try allocator.dupe(u8, v);
+        initialized += 1;
+    }
+    return switch (def) {
+        .enum_def => .{ .enum_def = new_vals },
+        .set_def => .{ .set_def = new_vals },
+    };
 }
 
 /// Resolve an enum integer value to its string label.
@@ -402,7 +452,7 @@ pub const SchemaCache = struct {
         for (result_set.rows, 0..) |row, idx| {
             if (row.values.len < 6) continue;
 
-            const col = ColumnInfo{
+            var col = ColumnInfo{
                 .column_name = try self.allocator.dupe(u8, row.values[0] orelse ""),
                 .column_type = try self.allocator.dupe(u8, row.values[1] orelse ""),
                 .is_nullable = if (row.values[2]) |v| std.mem.eql(u8, v, "YES") else false,
@@ -411,6 +461,8 @@ pub const SchemaCache = struct {
                 .column_extra = try self.allocator.dupe(u8, row.values[5] orelse ""),
                 .ordinal_position = idx + 1,
             };
+            errdefer col.deinit(self.allocator);
+            try col.refreshParsedEnumSet(self.allocator);
 
             try columns.append(self.allocator, col);
         }

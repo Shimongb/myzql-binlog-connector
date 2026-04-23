@@ -98,4 +98,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // === INTEGRATION TEST ===
+    // `zig build integration-test` boots the docker MySQL container,
+    // runs a scripted DDL/DML scenario, exercises the connector end-to-
+    // end, and asserts on column-name resolution, ENUM labels, and
+    // schema-cache persistence. Requires Docker to be available on the
+    // host. Skipped silently in environments without docker.
+    const integration_cmd = b.addSystemCommand(&.{"./docker/integration_test.sh"});
+    integration_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| integration_cmd.addArgs(args); // e.g. --keep
+    const integration_step = b.step("integration-test", "Run docker-based end-to-end integration test");
+    integration_step.dependOn(&integration_cmd.step);
 }

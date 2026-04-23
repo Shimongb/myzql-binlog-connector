@@ -158,12 +158,11 @@ pub const RowJsonSerializer = struct {
         // Guard against negative values (corrupted data or unsigned interpretation)
         if (int_val < 0) return false;
 
-        // Check if this column is an enum or set type
-        const def = schema_cache_mod.parseEnumSetDef(self.allocator, col.column_type) catch return false;
-        if (def == null) return false;
-        defer schema_cache_mod.freeEnumSetDef(self.allocator, def.?);
+        // Use the cached parse from ColumnInfo. Populated once at schema
+        // resolution time (DESCRIBE / DDL / cache load); no per-row alloc.
+        const def = col.parsed_enum_set orelse return false;
 
-        switch (def.?) {
+        switch (def) {
             .enum_def => |members| {
                 if (schema_cache_mod.resolveEnumValue(members, int_val)) |label| {
                     try writer.writeByte('"');
@@ -489,4 +488,131 @@ test "bool coercion: tinyint(10) must not match tinyint(1) prefix" {
     const values = [_]event_parser.RowValue{.{ .tiny = 7 }};
     const result = try s.serializeWithColumns(&values, &cols);
     try std.testing.expectEqualStrings("{\"n\":7}", result);
+}
+
+// ------------------------------------------------------------
+// Enum/Set resolution via cached ColumnInfo.parsed_enum_set
+// ------------------------------------------------------------
+//
+// These tests verify that the serializer reads the pre-parsed EnumSetDef
+// from ColumnInfo rather than re-parsing on every row (the hot-path fix
+// from the column-awareness performance follow-up). All defs below are
+// constructed statically so no allocator ownership is involved.
+
+const enum_status_members = [_][]const u8{ "active", "inactive", "pending" };
+const set_perms_members = [_][]const u8{ "read", "write", "exec" };
+
+fn makeEnumCol(name: []const u8, column_type: []const u8, members: []const []const u8) ColumnInfo {
+    return .{
+        .column_name = name,
+        .column_type = column_type,
+        .is_nullable = true,
+        .column_key = "",
+        .column_default = null,
+        .column_extra = "",
+        .ordinal_position = 1,
+        .parsed_enum_set = .{ .enum_def = members },
+    };
+}
+
+fn makeSetCol(name: []const u8, column_type: []const u8, members: []const []const u8) ColumnInfo {
+    return .{
+        .column_name = name,
+        .column_type = column_type,
+        .is_nullable = true,
+        .column_key = "",
+        .column_default = null,
+        .column_extra = "",
+        .ordinal_position = 1,
+        .parsed_enum_set = .{ .set_def = members },
+    };
+}
+
+test "enum resolution: cached def renders label" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeEnumCol("status", "enum('active','inactive','pending')", &enum_status_members)};
+    const values = [_]event_parser.RowValue{.{ .tiny = 2 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"status\":\"inactive\"}", result);
+}
+
+test "enum resolution: zero encodes as empty string (MySQL semantics)" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeEnumCol("status", "enum('active','inactive')", enum_status_members[0..2])};
+    const values = [_]event_parser.RowValue{.{ .tiny = 0 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"status\":\"\"}", result);
+}
+
+test "enum resolution: out-of-range value falls through to integer" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeEnumCol("status", "enum('active','inactive','pending')", &enum_status_members)};
+    const values = [_]event_parser.RowValue{.{ .tiny = 99 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"status\":99}", result);
+}
+
+test "set resolution: bitmask renders comma-joined labels" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{makeSetCol("perms", "set('read','write','exec')", &set_perms_members)};
+    // 0b101 = read + exec
+    const values = [_]event_parser.RowValue{.{ .long = 5 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"perms\":\"read,exec\"}", result);
+}
+
+test "enum resolution: missing parsed_enum_set falls through to integer" {
+    // Guards against regression where a stale cache entry or un-refreshed
+    // column would cause enum values to be silently rendered as numbers.
+    // The serializer MUST NOT re-parse column_type to rescue this case.
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const cols = [_]ColumnInfo{.{
+        .column_name = "status",
+        .column_type = "enum('active','inactive')",
+        .is_nullable = true,
+        .column_key = "",
+        .column_default = null,
+        .column_extra = "",
+        .ordinal_position = 1,
+        .parsed_enum_set = null,
+    }};
+    const values = [_]event_parser.RowValue{.{ .tiny = 1 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"status\":1}", result);
+}
+
+test "enum resolution: refreshParsedEnumSet populates cache for serializer" {
+    // End-to-end: start from a raw ColumnInfo (as if just built from a
+    // DESCRIBE row before refresh), call refreshParsedEnumSet, and confirm
+    // the serializer picks up the cached def.
+    const allocator = std.testing.allocator;
+    var s = RowJsonSerializer.init(allocator, .auto_bool);
+    defer s.deinit();
+
+    var col = ColumnInfo{
+        .column_name = try allocator.dupe(u8, "status"),
+        .column_type = try allocator.dupe(u8, "enum('a','b','c')"),
+        .is_nullable = true,
+        .column_key = try allocator.dupe(u8, ""),
+        .column_default = null,
+        .column_extra = try allocator.dupe(u8, ""),
+        .ordinal_position = 1,
+    };
+    defer col.deinit(allocator);
+    try col.refreshParsedEnumSet(allocator);
+
+    const cols = [_]ColumnInfo{col};
+    const values = [_]event_parser.RowValue{.{ .tiny = 3 }};
+    const result = try s.serializeWithColumns(&values, &cols);
+    try std.testing.expectEqualStrings("{\"status\":\"c\"}", result);
 }
