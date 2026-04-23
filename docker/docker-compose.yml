@@ -1,0 +1,20 @@
+services:
+  mysql-ssl:
+    build: .
+    container_name: myzql-ssl-test
+    ports:
+      - "23306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+    # Healthcheck: require TLS handshake succeeds
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--ssl-mode=REQUIRED"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      # Persist datadir across restarts so binlog state survives
+      - mysql_ssl_data:/var/lib/mysql
+
+volumes:
+  mysql_ssl_data:

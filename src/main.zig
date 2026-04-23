@@ -219,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Load schema cache from disk if configured
     if (config.schema_cache_dir) |cache_dir| {
-        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, cache_dir) catch 0;
+        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, cache_dir, config.schema_cache_ttl_seconds, init.io) catch 0;
         if (loaded > 0) {
             log.info("loaded {d} table schemas from cache", .{loaded});
         }
@@ -344,7 +344,7 @@ pub fn main(init: std.process.Init) !void {
     // Save schema cache before shutdown
     if (config.schema_cache_dir) |cache_dir| {
         if (reader.schema_cache.count() > 0) {
-            if (cache_persistence.saveCache(allocator, &reader.schema_cache, cache_dir)) |path| {
+            if (cache_persistence.saveCache(allocator, &reader.schema_cache, cache_dir, init.io)) |path| {
                 allocator.free(path);
             } else |err| {
                 log.warn("failed to save schema cache: {}", .{err});

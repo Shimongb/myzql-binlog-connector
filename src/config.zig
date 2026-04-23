@@ -138,6 +138,13 @@ pub const Config = struct {
 
     // === Schema Cache Settings ===
     schema_cache_dir: ?[]const u8 = null,
+    /// Staleness threshold for the persisted schema cache, in seconds.
+    /// Checked once at bootstrap against the cache file's storage-layer
+    /// mtime (local fstat now; S3 HEAD Last-Modified when that backend
+    /// lands). Null (the default) disables the check — any non-empty cache
+    /// is trusted. A recommended starting value is ~6h; shorter for
+    /// DDL-heavy sources, longer for stable schemas.
+    schema_cache_ttl_seconds: ?u64 = null,
 
     // === SSL/TLS Settings ===
     ssl: bool = true,

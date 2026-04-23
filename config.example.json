@@ -14,5 +14,7 @@
   ],
   "output_mode": "parquet",
   "parquet_output_dir": "./parquet_output",
-  "parquet_batch_size": 8192
+  "parquet_batch_size": 8192,
+  "schema_cache_dir": "./schema_cache",
+  "schema_cache_ttl_seconds": null
 }

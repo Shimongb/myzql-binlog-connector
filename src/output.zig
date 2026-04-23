@@ -23,6 +23,66 @@ const event_parser = @import("event_parser.zig");
 const schema_cache_mod = @import("schema_cache.zig");
 const ColumnInfo = schema_cache_mod.ColumnInfo;
 
+/// Column-aware formatter. If `col` carries a cached enum/set definition
+/// and `value` is an integer, renders the resolved label (e.g. `"alpha"`
+/// or `"r,w,x"`) instead of the raw integer. Otherwise falls through to
+/// the generic `formatRowValue`.
+///
+/// Uses a scratch allocator for SET resolution only; resolution failure
+/// silently falls through so malformed values still produce output
+/// rather than breaking the row.
+fn formatRowValueWithColumn(value: event_parser.RowValue, col: ColumnInfo) void {
+    const def = col.parsed_enum_set orelse {
+        formatRowValue(value);
+        return;
+    };
+
+    const int_val: i64 = switch (value) {
+        .tiny => |v| v,
+        .short => |v| v,
+        .long => |v| v,
+        .longlong => |v| v,
+        else => {
+            formatRowValue(value);
+            return;
+        },
+    };
+    if (int_val < 0) {
+        formatRowValue(value);
+        return;
+    }
+
+    switch (def) {
+        .enum_def => |members| {
+            if (schema_cache_mod.resolveEnumValue(members, int_val)) |label| {
+                std.debug.print("\"{s}\"", .{label});
+                return;
+            }
+        },
+        .set_def => |members| {
+            // Build the label into a stack buffer, then print atomically.
+            // SET(64) with typical short member names fits comfortably in
+            // 512 bytes; overflow falls back to the partial label written
+            // so far (debug output remains useful rather than erroring).
+            var buf: [512]u8 = undefined;
+            var w = std.Io.Writer.fixed(&buf);
+            var first = true;
+            var i: usize = 0;
+            while (i < members.len and i < 64) : (i += 1) {
+                if (int_val & (@as(i64, 1) << @intCast(i)) != 0) {
+                    if (!first) w.writeAll(",") catch break;
+                    w.writeAll(members[i]) catch break;
+                    first = false;
+                }
+            }
+            std.debug.print("\"{s}\"", .{w.buffered()});
+            return;
+        },
+    }
+    // Fall through if resolution didn't match (e.g. out-of-range enum).
+    formatRowValue(value);
+}
+
 /// Helper to format a RowValue for human-readable output
 fn formatRowValue(value: event_parser.RowValue) void {
     switch (value) {
@@ -185,16 +245,20 @@ pub fn printRowEventWithColumns(event: event_parser.Event, row_event: event_pars
     if (row_event.before_values) |before| {
         std.debug.print("\nBefore Values ({d} columns):\n", .{before.len});
         for (before, 0..) |value, i| {
-            if (resolved_columns) |cols| {
-                if (i < cols.len) {
-                    std.debug.print("  {s}: ", .{cols[i].column_name});
-                } else {
-                    std.debug.print("  [{d}] ", .{i});
-                }
+            const col_opt: ?ColumnInfo = if (resolved_columns) |cols|
+                (if (i < cols.len) cols[i] else null)
+            else
+                null;
+            if (col_opt) |c| {
+                std.debug.print("  {s}: ", .{c.column_name});
             } else {
                 std.debug.print("  [{d}] ", .{i});
             }
-            formatRowValue(value);
+            if (col_opt) |c| {
+                formatRowValueWithColumn(value, c);
+            } else {
+                formatRowValue(value);
+            }
             std.debug.print("\n", .{});
         }
     }
@@ -203,16 +267,20 @@ pub fn printRowEventWithColumns(event: event_parser.Event, row_event: event_pars
     if (row_event.after_values) |after| {
         std.debug.print("\nAfter Values ({d} columns):\n", .{after.len});
         for (after, 0..) |value, i| {
-            if (resolved_columns) |cols| {
-                if (i < cols.len) {
-                    std.debug.print("  {s}: ", .{cols[i].column_name});
-                } else {
-                    std.debug.print("  [{d}] ", .{i});
-                }
+            const col_opt: ?ColumnInfo = if (resolved_columns) |cols|
+                (if (i < cols.len) cols[i] else null)
+            else
+                null;
+            if (col_opt) |c| {
+                std.debug.print("  {s}: ", .{c.column_name});
             } else {
                 std.debug.print("  [{d}] ", .{i});
             }
-            formatRowValue(value);
+            if (col_opt) |c| {
+                formatRowValueWithColumn(value, c);
+            } else {
+                formatRowValue(value);
+            }
             std.debug.print("\n", .{});
         }
     }
