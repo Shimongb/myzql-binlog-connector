@@ -17,48 +17,9 @@
 
 const std = @import("std");
 const thrift = @import("thrift_compact.zig");
-const posix = std.posix;
+const object_store = @import("object_store.zig");
 
 const PARQUET_MAGIC = "PAR1";
-
-/// Simple POSIX file wrapper for writing (replaces std.fs.File for 0.16 compat)
-const PosixFile = struct {
-    fd: posix.fd_t,
-
-    fn create(path: []const u8) !PosixFile {
-        const fd = try posix.openat(posix.AT.FDCWD, path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .TRUNC = true,
-        }, 0o644);
-        return .{ .fd = fd };
-    }
-
-    fn writeAll(self: PosixFile, bytes: []const u8) !void {
-        var index: usize = 0;
-        while (index < bytes.len) {
-            const remaining = bytes[index..];
-            const rc = posix.system.write(self.fd, remaining.ptr, remaining.len);
-            const errno = posix.errno(rc);
-            if (errno != .SUCCESS) {
-                return switch (errno) {
-                    .INTR => continue,
-                    .AGAIN => continue,
-                    .IO => error.InputOutput,
-                    .NOSPC => error.NoSpaceLeft,
-                    else => posix.unexpectedErrno(errno),
-                };
-            }
-            const written: usize = @intCast(rc);
-            if (written == 0) return error.Unexpected;
-            index += written;
-        }
-    }
-
-    fn close(self: PosixFile) void {
-        _ = posix.system.close(self.fd);
-    }
-};
 
 /// Column index constants
 const COL_TIMESTAMP = 0;
@@ -175,17 +136,28 @@ pub const ParquetWriter = struct {
     // readable individually, but mixing them into a directory glob makes
     // downstream readers iterate extra files for no benefit — and a broken
     // empty file (pre-0.16 gzip bug) would poison the whole glob.
-    file: ?PosixFile,
-    file_path: []const u8,
+    //
+    // Writes go through ObjectStore.WriteHandle: a sidecar temp file is
+    // opened lazily, written chunk by chunk, and renamed into place on
+    // `finish()` (commit). `deinit()` on an unfinished writer aborts the
+    // sidecar so partial data never becomes visible.
+    write_handle: ?object_store.WriteHandle,
+    store: *object_store.ObjectStore,
+    key: []const u8,
     allocator: std.mem.Allocator,
     row_groups: std.ArrayList(RowGroupInfo),
     total_rows: i64,
     bytes_written: u64,
 
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !ParquetWriter {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        store: *object_store.ObjectStore,
+        key: []const u8,
+    ) !ParquetWriter {
         return ParquetWriter{
-            .file = null,
-            .file_path = try allocator.dupe(u8, file_path),
+            .write_handle = null,
+            .store = store,
+            .key = try allocator.dupe(u8, key),
             .allocator = allocator,
             .row_groups = .empty,
             .total_rows = 0,
@@ -195,19 +167,23 @@ pub const ParquetWriter = struct {
 
     pub fn deinit(self: *ParquetWriter) void {
         self.row_groups.deinit(self.allocator);
-        if (self.file) |f| f.close();
-        self.allocator.free(self.file_path);
+        // If finish() wasn't called (or failed before commit), discard the
+        // sidecar so no partial file is left visible.
+        if (self.write_handle) |*h| h.abort();
+        self.allocator.free(self.key);
     }
 
-    /// Lazily open the file and write the leading PAR1 magic on first use.
-    fn ensureOpen(self: *ParquetWriter) !*PosixFile {
-        if (self.file == null) {
-            const f = try PosixFile.create(self.file_path);
-            self.file = f;
-            try f.writeAll(PARQUET_MAGIC);
+    /// Lazily open the write handle and emit the leading PAR1 magic on
+    /// first use.
+    fn ensureOpen(self: *ParquetWriter) !*object_store.WriteHandle {
+        if (self.write_handle == null) {
+            var h = try self.store.create(self.key);
+            errdefer h.abort();
+            try h.write(PARQUET_MAGIC);
+            self.write_handle = h;
             self.bytes_written = 4;
         }
-        return &self.file.?;
+        return &self.write_handle.?;
     }
 
     pub fn writeRowGroup(self: *ParquetWriter, batch: *const RowBatch) !void {
@@ -314,10 +290,10 @@ pub const ParquetWriter = struct {
         const data_page_offset = file_offset;
 
         // Write page header + compressed data.
-        // `writeRowGroup` has already ensured the file is open, so unwrap directly.
-        const file = &self.file.?;
-        try file.writeAll(page_header_buf.items);
-        try file.writeAll(compressed_data);
+        // `writeRowGroup` has already ensured the handle is open, so unwrap directly.
+        const handle = &self.write_handle.?;
+        try handle.write(page_header_buf.items);
+        try handle.write(compressed_data);
 
         const total_written = page_header_buf.items.len + compressed_data.len;
         self.bytes_written += total_written;
@@ -451,11 +427,15 @@ pub const ParquetWriter = struct {
     }
 
     pub fn finish(self: *ParquetWriter) !void {
-        // If no row groups were written, no file was ever created — skip the
-        // footer entirely so the output directory stays free of zero-row
+        // If no row groups were written, discard any in-flight sidecar and
+        // skip the footer — the output directory stays free of zero-row
         // parquets. Downstream readers using `dir/*.parquet` globs would
         // otherwise have to open (and tolerate) empty files on every rotate.
-        if (self.file == null or self.row_groups.items.len == 0) {
+        if (self.write_handle == null or self.row_groups.items.len == 0) {
+            if (self.write_handle) |*h| {
+                h.abort();
+                self.write_handle = null;
+            }
             return;
         }
 
@@ -560,19 +540,27 @@ pub const ParquetWriter = struct {
 
         try tw.endRootStruct();
 
-        // Write footer. The early-return above guarantees `self.file` is non-null here.
-        const file = &self.file.?;
+        // Write footer. The early-return above guarantees `self.write_handle`
+        // is non-null here.
+        const handle = &self.write_handle.?;
         const footer_data = tw.getWritten();
-        try file.writeAll(footer_data);
+        try handle.write(footer_data);
 
         // Write footer length (4 bytes LE)
         const footer_len: u32 = @intCast(footer_data.len);
-        try file.writeAll(&std.mem.toBytes(std.mem.nativeToLittle(u32, footer_len)));
+        try handle.write(&std.mem.toBytes(std.mem.nativeToLittle(u32, footer_len)));
 
         // Write trailing magic
-        try file.writeAll(PARQUET_MAGIC);
+        try handle.write(PARQUET_MAGIC);
 
         self.bytes_written += footer_data.len + 4 + 4;
+
+        // Commit: close + atomic rename. After this, the write handle is
+        // finalized — null it out so deinit() doesn't double-cleanup.
+        // On commit failure the abstraction already cleans up the sidecar;
+        // we still null the handle so the caller's defer deinit() is safe.
+        defer self.write_handle = null;
+        try handle.commit();
     }
 
     pub fn getBytesWritten(self: *const ParquetWriter) u64 {

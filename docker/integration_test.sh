@@ -221,10 +221,13 @@ grep -qE 'kind:\s*"(alpha|beta|gamma)"' "$RUN1" || {
 }
 
 echo "==> Asserting schema cache was written..."
+# Content-addressable layout: <cache_dir>/schema-cache/<16-hex-hash>.json.gz
+# with a .schema_cache_latest pointer at the cache dir root. Pointer file
+# will retire in Step 4 when the binlog checkpoint carries the key.
 shopt -s nullglob
-caches=("$CACHE_DIR"/schema_cache_*.json.gz)
+caches=("$CACHE_DIR"/schema-cache/*.json.gz)
 shopt -u nullglob
-[ ${#caches[@]} -gt 0 ] || fail "no schema_cache_*.json.gz files in $CACHE_DIR"
+[ ${#caches[@]} -gt 0 ] || fail "no schema-cache/*.json.gz files in $CACHE_DIR"
 [ -f "$CACHE_DIR/.schema_cache_latest" ] || fail ".schema_cache_latest pointer missing"
 
 # Verify the cache file really is gzipped (first two bytes = 1f 8b).

@@ -1,12 +1,27 @@
 //! Cache Persistence Module
 //!
-//! Saves and loads the SchemaCache to/from local JSON files with
-//! content-addressable filenames (SHA-256 based).
+//! Saves and loads the SchemaCache through the ObjectStore abstraction.
+//! Content-addressable: the filename is the first 16 hex chars of SHA-256
+//! over the stable JSON body (version + schemas only; `saved_at_unix` is
+//! wrapped on top but excluded from the hash so identical schemas produce
+//! identical keys across runs).
 //!
-//! File format: schema_cache_{checksum}.json
-//! Where checksum = first 8 bytes of SHA-256, formatted as 16-char hex.
+//! Key layout under the store's root:
+//!   schema-cache/{16-hex-hash}.json.gz   — the cache payload
+//!   .schema_cache_latest                  — pointer to current cache key
+//!
+//! Identical schemas → identical keys → overwrite (not a new file); on S3
+//! that's ~90-99% fewer writes. Different schemas → new key; no separate
+//! index file is maintained because the content *is* the index. Stale
+//! keys orphan naturally on schema change — S3 lifecycle sweeps them
+//! downstream; on PosixStore a handful of stale files accumulates, which
+//! is fine.
+//!
+//! The `.schema_cache_latest` pointer goes away in Step 4 when the
+//! binlog checkpoint carries the cache key directly.
 
 const std = @import("std");
+const object_store = @import("object_store.zig");
 const schema_cache_mod = @import("schema_cache.zig");
 const SchemaCache = schema_cache_mod.SchemaCache;
 const TableSchema = schema_cache_mod.TableSchema;
@@ -14,19 +29,36 @@ const ColumnInfo = schema_cache_mod.ColumnInfo;
 
 const log = std.log.scoped(.cache_persistence);
 
-/// Bumped from 1 → 2 when `saved_at_unix` was added to the top-level JSON.
-/// v1 files are rejected by `deserializeCacheFromJson` (logged and skipped).
+/// Bumped when the stable body format changes.
+/// v1: initial
+/// v2: added top-level `saved_at_unix` (wrapped; not part of the hash)
+/// On load, older versions are rejected by `deserializeCacheFromJson` and
+/// the connector cold-starts.
 const CACHE_VERSION: u32 = 2;
 
-/// Save the schema cache to a JSON file in the given directory.
-/// Returns the filename used (content-addressable).
+const CACHE_PREFIX = "schema-cache/";
+const LATEST_POINTER_KEY = ".schema_cache_latest";
+
+/// Save the schema cache through the `ObjectStore`. Returns the key
+/// used (content-addressable).
 ///
 /// Filename hash is computed over the stable body (version + schemas)
 /// only — `saved_at_unix` is wrapped on top for disk writes but excluded
-/// from the hash so identical schemas produce identical filenames across
-/// runs, enabling deduplication and predictable cleanup.
-pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const u8, io: std.Io) ![]const u8 {
-    // Serialize the stable (hashable) body.
+/// from the hash so identical schemas produce identical keys across
+/// runs, enabling overwrite-on-unchanged (dedup) semantics.
+///
+/// Writes are atomic at the ObjectStore layer (sidecar + rename for
+/// PosixStore; single PUT / multipart for S3Store later). The
+/// `.schema_cache_latest` pointer is written after the cache file so a
+/// mid-save crash never leaves the pointer dangling at a missing key.
+pub fn saveCache(
+    allocator: std.mem.Allocator,
+    cache: *SchemaCache,
+    store: *object_store.ObjectStore,
+    io: std.Io,
+) ![]const u8 {
+    // Serialize the stable (hashable) body. Table keys are sorted inside
+    // `serializeCacheToJson` so the hash is deterministic across runs.
     const stable_json = try serializeCacheToJson(allocator, cache);
     defer allocator.free(stable_json);
 
@@ -47,184 +79,83 @@ pub fn saveCache(allocator: std.mem.Allocator, cache: *SchemaCache, dir: []const
     const disk_payload = try gzipCompress(allocator, disk_json);
     defer allocator.free(disk_payload);
 
-    // Build full path — gzipped JSON going forward. Plain `.json` files
-    // from older runs remain readable (magic-byte detection in loader).
-    const full_path = try std.fmt.allocPrint(allocator, "{s}/schema_cache_{s}.json.gz", .{ dir, checksum_hex });
-    errdefer allocator.free(full_path);
+    // Key under the store: schema-cache/{hash}.json.gz
+    const cache_key = try std.fmt.allocPrint(
+        allocator,
+        CACHE_PREFIX ++ "{s}.json.gz",
+        .{checksum_hex},
+    );
+    errdefer allocator.free(cache_key);
 
-    // Ensure directory exists (best-effort mkdir -p via posix)
-    makeDirPath(allocator, dir);
-
-    // Write file using posix
-    const path_z = try allocator.dupeZ(u8, full_path);
-    defer allocator.free(path_z);
-
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-    }, 0o644) catch |err| {
-        log.err("failed to create cache file '{s}': {}", .{ full_path, err });
-        return err;
-    };
-    defer _ = std.posix.system.close(fd);
-
-    var written: usize = 0;
-    while (written < disk_payload.len) {
-        const rc = std.posix.system.write(fd, disk_payload[written..].ptr, disk_payload[written..].len);
-        const signed_rc: isize = @bitCast(rc);
-        if (signed_rc < 0) {
-            log.err("failed to write cache file", .{});
-            return error.WriteError;
-        }
-        written += @intCast(signed_rc);
+    // Write the cache file via ObjectStore (atomic).
+    {
+        var h = store.create(cache_key) catch |err| {
+            log.err("failed to create cache key '{s}': {}", .{ cache_key, err });
+            return err;
+        };
+        errdefer h.abort();
+        try h.write(disk_payload);
+        try h.commit();
     }
 
-    // Write a pointer file so loadCache knows which file to load
-    const latest_path = try std.fmt.allocPrint(allocator, "{s}/.schema_cache_latest", .{dir});
-    defer allocator.free(latest_path);
-    const latest_z = try allocator.dupeZ(u8, latest_path);
-    defer allocator.free(latest_z);
-
-    const latest_fd = std.posix.openat(std.posix.AT.FDCWD, latest_z, .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .TRUNC = true,
-    }, 0o644) catch |err| {
-        log.warn("failed to write .schema_cache_latest: {}", .{err});
-        return full_path; // Non-fatal, cache was still saved
-    };
-    defer _ = std.posix.system.close(latest_fd);
-    _ = std.posix.system.write(latest_fd, full_path.ptr, full_path.len);
-
-    log.info("schema cache saved: {s} ({d} bytes gzip / {d} bytes raw, {d} tables)", .{ full_path, disk_payload.len, disk_json.len, cache.count() });
-
-    // Best-effort cleanup of older content-addressable files. Runs AFTER
-    // the new file + latest pointer are durably written, so a crash here
-    // never leaves us without a usable cache.
-    pruneOldCacheFiles(allocator, dir, DEFAULT_KEEP_N, io);
-
-    return full_path;
-}
-
-/// How many historical cache files to retain per directory.
-/// The most recent N (by mtime) survive a prune pass; the rest are
-/// deleted. The file currently referenced by `.schema_cache_latest` is
-/// additionally protected as a belt-and-suspenders guard.
-const DEFAULT_KEEP_N: usize = 3;
-
-/// Delete stale `schema_cache_*.json(.gz)` files in `dir`, keeping the
-/// `keep_n` most recently modified and always preserving the file
-/// referenced by `.schema_cache_latest`.
-///
-/// Best-effort: all errors are logged at debug level and swallowed, since
-/// failing to prune old files must never break a successful save.
-pub fn pruneOldCacheFiles(allocator: std.mem.Allocator, dir: []const u8, keep_n: usize, io: std.Io) void {
-    var dir_handle = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch |err| {
-        log.debug("prune: couldn't open cache dir '{s}': {}", .{ dir, err });
-        return;
-    };
-    defer dir_handle.close(io);
-
-    const CacheFile = struct {
-        name: []u8,
-        mtime_ns: i96,
-    };
-
-    var files: std.ArrayList(CacheFile) = .empty;
-    defer {
-        for (files.items) |f| allocator.free(f.name);
-        files.deinit(allocator);
-    }
-
-    var iter = dir_handle.iterate();
-    while (iter.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.name, "schema_cache_")) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json") and
-            !std.mem.endsWith(u8, entry.name, ".json.gz")) continue;
-
-        const stat = dir_handle.statFile(io, entry.name, .{}) catch continue;
-
-        const name_dup = allocator.dupe(u8, entry.name) catch continue;
-        files.append(allocator, .{ .name = name_dup, .mtime_ns = stat.mtime.nanoseconds }) catch {
-            allocator.free(name_dup);
-            continue;
+    // Write the .schema_cache_latest pointer. Non-fatal if this fails
+    // because the cache file itself is durably on disk; next run will
+    // just cold-start without a resume.
+    {
+        var h = store.create(LATEST_POINTER_KEY) catch |err| {
+            log.warn("failed to write .schema_cache_latest: {}", .{err});
+            return cache_key;
+        };
+        errdefer h.abort();
+        h.write(cache_key) catch |err| {
+            log.warn("failed to write pointer content: {}", .{err});
+            return cache_key;
+        };
+        h.commit() catch |err| {
+            log.warn("failed to commit pointer: {}", .{err});
+            return cache_key;
         };
     }
 
-    if (files.items.len <= keep_n) return;
+    log.info(
+        "schema cache saved: {s} ({d} bytes gzip / {d} bytes raw, {d} tables)",
+        .{ cache_key, disk_payload.len, disk_json.len, cache.count() },
+    );
 
-    std.mem.sort(CacheFile, files.items, {}, struct {
-        fn lt(_: void, a: CacheFile, b: CacheFile) bool {
-            return a.mtime_ns > b.mtime_ns; // newest first
-        }
-    }.lt);
-
-    const latest_path_opt = readLatestPointer(allocator, dir) catch null;
-    defer if (latest_path_opt) |p| allocator.free(p);
-    const latest_basename: ?[]const u8 = if (latest_path_opt) |p|
-        std.fs.path.basename(p)
-    else
-        null;
-
-    var deleted: usize = 0;
-    for (files.items[keep_n..]) |f| {
-        if (latest_basename) |lb| {
-            if (std.mem.eql(u8, f.name, lb)) continue;
-        }
-        dir_handle.deleteFile(io, f.name) catch |err| {
-            log.debug("prune: failed to delete '{s}': {}", .{ f.name, err });
-            continue;
-        };
-        deleted += 1;
-    }
-
-    if (deleted > 0) {
-        log.info("prune: removed {d} stale schema cache file(s) from '{s}'", .{ deleted, dir });
-    }
+    return cache_key;
 }
 
-/// Load the schema cache from a specific file path.
-pub fn loadCacheFromFile(allocator: std.mem.Allocator, cache: *SchemaCache, path: []const u8) !usize {
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
+// Pruning is intentionally removed. Content-addressable naming means
+// stable schemas produce stable keys — `create(key)` overwrites on a
+// repeat save instead of generating a new file — so no dir-wide sweep
+// is needed. Stale keys from past schema revisions orphan naturally on
+// change; on S3 they're swept by lifecycle; on PosixStore a handful
+// accumulates and is fine.
+//
+// The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + .schema_cache_latest
+// protection` machinery has been removed wholesale.
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{}, 0) catch |err| {
-        log.debug("cache file '{s}' not accessible: {}", .{ path, err });
-        return 0;
+/// Load the schema cache by its ObjectStore key.
+pub fn loadCacheFromKey(
+    allocator: std.mem.Allocator,
+    cache: *SchemaCache,
+    store: *object_store.ObjectStore,
+    key: []const u8,
+) !usize {
+    const raw_bytes = store.read(allocator, key) catch |err| switch (err) {
+        object_store.Error.NotFound => {
+            log.debug("cache key '{s}' not found", .{key});
+            return 0;
+        },
+        else => {
+            log.warn("cache key '{s}' read failed: {}", .{ key, err });
+            return 0;
+        },
     };
-    defer _ = std.posix.system.close(fd);
+    defer allocator.free(raw_bytes);
 
-    // Get file size
-    const file_size: u64 = blk: {
-        if (comptime @import("builtin").os.tag == .linux) {
-            const linux = std.os.linux;
-            var stx = std.mem.zeroes(linux.Statx);
-            const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &stx);
-            if (linux.errno(rc) != .SUCCESS) return 0;
-            if (!stx.mask.SIZE) return 0;
-            break :blk stx.size;
-        } else {
-            var stat: std.posix.system.Stat = undefined;
-            if (std.posix.system.fstat(fd, &stat) != 0) return 0;
-            break :blk @intCast(stat.size);
-        }
-    };
+    if (raw_bytes.len == 0 or raw_bytes.len > 100 * 1024 * 1024) return 0;
 
-    if (file_size == 0 or file_size > 100 * 1024 * 1024) return 0;
-
-    const json_data = try allocator.alloc(u8, file_size);
-    defer allocator.free(json_data);
-
-    var total_read: usize = 0;
-    while (total_read < file_size) {
-        const n = std.posix.read(fd, json_data[total_read..]) catch return 0;
-        if (n == 0) break;
-        total_read += n;
-    }
-
-    const raw_bytes = json_data[0..total_read];
     // Detect on-disk compression via magic bytes rather than filename so
     // that moving/renaming files (or legacy plain `.json` files written
     // before gzip landed) still round-trip correctly.
@@ -232,95 +163,73 @@ pub fn loadCacheFromFile(allocator: std.mem.Allocator, cache: *SchemaCache, path
     defer if (decoded) |d| allocator.free(d);
     const body: []const u8 = if (looksLikeGzip(raw_bytes)) blk: {
         decoded = gzipDecompress(allocator, raw_bytes) catch |err| {
-            log.warn("gzip decompress failed for '{s}': {}", .{ path, err });
+            log.warn("gzip decompress failed for '{s}': {}", .{ key, err });
             return 0;
         };
         break :blk decoded.?;
     } else raw_bytes;
 
     const tables_loaded = deserializeCacheFromJson(allocator, cache, body) catch |err| {
-        log.warn("failed to deserialize cache from '{s}': {}", .{ path, err });
+        log.warn("failed to deserialize cache from '{s}': {}", .{ key, err });
         return 0;
     };
 
-    log.info("schema cache loaded: {s} ({d} tables)", .{ path, tables_loaded });
+    log.info("schema cache loaded: {s} ({d} tables)", .{ key, tables_loaded });
     return tables_loaded;
 }
 
-/// Load the most recent schema cache from the given directory.
-/// Reads the `.schema_cache_latest` pointer file to find the cache file.
-/// `ttl_seconds` (opt-in): if non-null, the file's storage-layer mtime is
-/// checked at bootstrap; anything older than `now - ttl` is treated as
-/// stale and skipped (caller proceeds as a cold run). Null disables the
-/// check.
+/// Load the most recent schema cache through the `ObjectStore`. Reads
+/// the `.schema_cache_latest` pointer to find the current cache key.
+/// `ttl_seconds` (opt-in): if non-null, the cache's storage-layer
+/// last-modified time is checked; anything older than `now - ttl` is
+/// treated as stale and skipped (caller proceeds as a cold run). Null
+/// disables the check.
 pub fn loadCache(
     allocator: std.mem.Allocator,
     cache: *SchemaCache,
-    dir: []const u8,
+    store: *object_store.ObjectStore,
     ttl_seconds: ?u64,
     io: std.Io,
 ) !usize {
-    const cache_path = (try readLatestPointer(allocator, dir)) orelse {
-        log.debug("no .schema_cache_latest in '{s}'", .{dir});
-        return 0;
+    // Resolve the current cache key from the pointer.
+    const raw_pointer = store.read(allocator, LATEST_POINTER_KEY) catch |err| switch (err) {
+        object_store.Error.NotFound => {
+            log.debug("no .schema_cache_latest pointer", .{});
+            return 0;
+        },
+        else => return 0,
     };
-    defer allocator.free(cache_path);
+    defer allocator.free(raw_pointer);
 
-    // Staleness check — bootstrap-only. Uses storage-layer mtime so a
-    // future S3 backend can answer the question with HEAD alone, no GET.
+    const cache_key = std.mem.trim(u8, raw_pointer, "\n\r \t");
+    if (cache_key.len == 0) return 0;
+
+    // Staleness check — bootstrap-only. Uses storage-layer last-modified
+    // so an S3 backend can answer via HEAD alone, no GET.
     if (ttl_seconds) |ttl| {
-        if (try getFileMtime(io, cache_path)) |mtime| {
+        if (store.head(cache_key)) |info| {
             const now_ts = std.Io.Clock.now(.real, io);
             const now: i64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
+            const mtime: i64 = @divFloor(info.last_modified_ms, std.time.ms_per_s);
             if (isStaleByTtl(mtime, now, ttl)) {
                 log.warn(
                     "schema cache '{s}' is stale (age {d}s, TTL {d}s); cold-starting",
-                    .{ cache_path, now - mtime, ttl },
+                    .{ cache_key, now - mtime, ttl },
                 );
                 return 0;
             }
-        } else {
-            // Backend didn't report mtime. Fallback path (saved_at_unix
-            // inside the JSON) isn't wired up yet — see item 4 in
-            // ROADMAP_COLUMN_AWARENESS.md. For now we accept the cache
-            // rather than forcing a cold start on every run.
-            log.debug("cache mtime unavailable; TTL check skipped for '{s}'", .{cache_path});
+        } else |err| switch (err) {
+            object_store.Error.NotFound => {
+                log.warn("pointer references missing key '{s}'; cold-starting", .{cache_key});
+                return 0;
+            },
+            else => {
+                log.debug("store.head failed ({}); TTL check skipped", .{err});
+            },
         }
     }
 
-    return try loadCacheFromFile(allocator, cache, cache_path);
-}
-
-/// Read `.schema_cache_latest` and return the cache file path it points
-/// to. Caller owns the returned slice. Returns null if the pointer file
-/// is missing or empty.
-fn readLatestPointer(allocator: std.mem.Allocator, dir: []const u8) !?[]u8 {
-    const latest_path = try std.fmt.allocPrint(allocator, "{s}/.schema_cache_latest", .{dir});
-    defer allocator.free(latest_path);
-
-    const latest_z = try allocator.dupeZ(u8, latest_path);
-    defer allocator.free(latest_z);
-
-    const fd = std.posix.openat(std.posix.AT.FDCWD, latest_z, .{}, 0) catch return null;
-    defer _ = std.posix.system.close(fd);
-
-    var path_buf: [4096]u8 = undefined;
-    const n = std.posix.read(fd, &path_buf) catch return null;
-    if (n == 0) return null;
-
-    const trimmed = std.mem.trim(u8, path_buf[0..n], "\n\r \t");
-    if (trimmed.len == 0) return null;
-
-    return try allocator.dupe(u8, trimmed);
-}
-
-/// Return the mtime (Unix seconds) of the file at `path`, or null if it
-/// can't be determined. Isolated helper so a future S3 backend can swap
-/// in a HEAD-based implementation without touching the TTL check itself.
-fn getFileMtime(io: std.Io, path: []const u8) !?i64 {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
-    // stat.mtime.nanoseconds is i96 nanoseconds since the Unix epoch.
-    return @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
+    return try loadCacheFromKey(allocator, cache, store, cache_key);
 }
 
 /// Pure predicate — exposed for unit testing. `mtime` and `now` are Unix
@@ -331,22 +240,35 @@ pub fn isStaleByTtl(mtime: i64, now: i64, ttl_seconds: u64) bool {
     return age > ttl_seconds;
 }
 
-/// Best-effort mkdir -p using posix.
-fn makeDirPath(allocator: std.mem.Allocator, path: []const u8) void {
-    const path_z = allocator.dupeZ(u8, path) catch return;
-    defer allocator.free(path_z);
+// (`makeDirPath`, `readLatestPointer`, `getFileMtime` removed: the
+// ObjectStore handles directory creation lazily and mtime via head(),
+// and the pointer is a first-class key read through store.read.)
 
-    if (comptime @import("builtin").os.tag == .linux) {
-        _ = std.os.linux.mkdir(path_z, 0o755);
-    } else {
-        _ = std.posix.system.mkdir(path_z, 0o755);
-    }
-}
-
-/// Serialize the cache to a JSON string.
+/// Serialize the cache to a JSON string with deterministic key order.
+///
+/// HashMap iteration order is undefined; without the sort below, two
+/// runs with identical schemas would produce different JSON bytes and
+/// therefore different content-addressable filenames. The sort is what
+/// makes "same schema → same key → overwrite, not new file" hold.
 fn serializeCacheToJson(allocator: std.mem.Allocator, cache: *SchemaCache) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
+
+    // Collect and sort table keys for deterministic output.
+    const Entry = struct { key: []const u8, value: *TableSchema };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(allocator);
+
+    var iter = cache.iterator();
+    while (iter.next()) |e| {
+        try entries.append(allocator, .{ .key = e.key_ptr.*, .value = e.value_ptr });
+    }
+
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lt(_: void, a: Entry, b: Entry) bool {
+            return std.mem.lessThan(u8, a.key, b.key);
+        }
+    }.lt);
 
     // Stable body — version + schemas only. `saved_at_unix` is wrapped on
     // top at write time by `wrapWithSavedAt`, so the content-addressable
@@ -355,18 +277,15 @@ fn serializeCacheToJson(allocator: std.mem.Allocator, cache: *SchemaCache) ![]co
     try appendInt(&buf, allocator, CACHE_VERSION);
     try buf.appendSlice(allocator, ",\"schemas\":{");
 
-    var first_table = true;
-    var iter = cache.iterator();
-    while (iter.next()) |entry| {
-        if (!first_table) try buf.append(allocator, ',');
-        first_table = false;
+    for (entries.items, 0..) |entry, idx| {
+        if (idx > 0) try buf.append(allocator, ',');
 
         // Key: "db.table"
         try buf.append(allocator, '"');
-        try appendJsonEscaped(&buf, allocator, entry.key_ptr.*);
+        try appendJsonEscaped(&buf, allocator, entry.key);
         try buf.appendSlice(allocator, "\":{");
 
-        const schema = entry.value_ptr;
+        const schema = entry.value;
 
         // columns_count
         try buf.appendSlice(allocator, "\"columns_count\":");
@@ -770,54 +689,9 @@ test "checksum is stable across saves when schemas don't change" {
     try std.testing.expectEqualSlices(u8, &computeChecksum(stable_a), &computeChecksum(stable_b));
 }
 
-test "pruneOldCacheFiles keeps the N newest and protects the latest pointer" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    // Create a temp dir with 5 cache files of increasing mtime.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(io, &path_buf);
-    const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
-    defer allocator.free(dir_path);
-
-    const names = [_][]const u8{
-        "schema_cache_aaaaaaaaaaaaaaaa.json",
-        "schema_cache_bbbbbbbbbbbbbbbb.json",
-        "schema_cache_cccccccccccccccc.json",
-        "schema_cache_dddddddddddddddd.json",
-        "schema_cache_eeeeeeeeeeeeeeee.json",
-    };
-    for (names) |n| {
-        const f = try tmp.dir.createFile(io, n, .{});
-        try f.writePositionalAll(io, "{}", 0);
-        f.close(io);
-        // Nudge mtime ordering — sleep a bit so newer files really are newer.
-        try std.Io.sleep(io, .fromMilliseconds(10), .real);
-    }
-
-    // Point `.schema_cache_latest` at the OLDEST file to verify the prune
-    // guard protects it even though it's not in the "newest N" set.
-    const latest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, names[0] });
-    defer allocator.free(latest_path);
-    const latest_file = try tmp.dir.createFile(io, ".schema_cache_latest", .{});
-    try latest_file.writePositionalAll(io, latest_path, 0);
-    latest_file.close(io);
-
-    // Keep the 2 newest; expect the 2 oldest NON-protected to be deleted.
-    pruneOldCacheFiles(allocator, dir_path, 2, io);
-
-    // The 2 newest (names[3], names[4]) must still exist.
-    _ = try tmp.dir.statFile(io, names[3], .{});
-    _ = try tmp.dir.statFile(io, names[4], .{});
-    // The protected (oldest but pointed to by latest) must still exist.
-    _ = try tmp.dir.statFile(io, names[0], .{});
-    // The middle two should be gone.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[1], .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, names[2], .{}));
-}
+// (Prune tests removed: content-addressable naming makes them moot —
+// identical schemas overwrite in place, different schemas orphan old
+// keys; ObjectStore has no list() and we no longer sweep the dir.)
 
 test "gzip round-trip preserves JSON content" {
     const allocator = std.testing.allocator;
@@ -855,6 +729,8 @@ test "loader transparently decodes gzipped payload" {
     const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
     defer allocator.free(dir_path);
 
+    var store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, dir_path) };
+
     // Build a minimal but valid cache and save it — this exercises the
     // gzip-write path end-to-end.
     var cache_out = SchemaCache.init(allocator, null);
@@ -867,40 +743,60 @@ test "loader transparently decodes gzipped payload" {
         .schema_version = version,
         .resolved_columns = null,
     });
-    const saved_path = try saveCache(allocator, &cache_out, dir_path, io);
-    defer allocator.free(saved_path);
+    const saved_key = try saveCache(allocator, &cache_out, &store, io);
+    defer allocator.free(saved_key);
 
-    // Filename suffix is the contract consumers rely on.
-    try std.testing.expect(std.mem.endsWith(u8, saved_path, ".json.gz"));
+    // Key contract: schema-cache/{hash}.json.gz
+    try std.testing.expect(std.mem.startsWith(u8, saved_key, "schema-cache/"));
+    try std.testing.expect(std.mem.endsWith(u8, saved_key, ".json.gz"));
 
-    // Now load it back — loader must detect gzip via magic bytes and
-    // decompress. If this succeeds the on-disk payload really is gzip.
+    // Now load it back — loader must resolve the pointer, detect gzip
+    // via magic bytes, and decompress.
     var cache_in = SchemaCache.init(allocator, null);
     defer cache_in.deinit();
-    const loaded = try loadCache(allocator, &cache_in, dir_path, null, io);
+    const loaded = try loadCache(allocator, &cache_in, &store, null, io);
     try std.testing.expectEqual(@as(usize, 1), loaded);
     try std.testing.expect(cache_in.get("testdb", "t1") != null);
 }
 
-test "pruneOldCacheFiles is a no-op when files <= keep_n" {
+test "identical schemas produce identical cache keys (overwrite, not churn)" {
+    // Content-addressable property: saving the same cache twice must
+    // land on the same key, so we overwrite instead of creating a new
+    // file. This guards against regressions in the key-sort
+    // determinism inside serializeCacheToJson.
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buf);
     const dir_path = try allocator.dupe(u8, path_buf[0..path_len]);
     defer allocator.free(dir_path);
 
-    const f = try tmp.dir.createFile(io, "schema_cache_0000000000000000.json", .{});
-    try f.writePositionalAll(io, "{}", 0);
-    f.close(io);
+    var store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, dir_path) };
 
-    pruneOldCacheFiles(allocator, dir_path, 3, io);
+    // Use multiple tables to exercise the HashMap-iteration-order path;
+    // pre-fix, these would hash differently across runs.
+    var cache = SchemaCache.init(allocator, null);
+    defer cache.deinit();
+    inline for (.{ "alpha", "bravo", "charlie" }) |name| {
+        const types = try allocator.dupe(u8, &[_]u8{3});
+        const version = try allocator.dupe(u8, "binlog.000001:100");
+        try cache.put("db", name, .{
+            .columns_count = 1,
+            .columns_types = types,
+            .schema_version = version,
+            .resolved_columns = null,
+        });
+    }
 
-    _ = try tmp.dir.statFile(io, "schema_cache_0000000000000000.json", .{});
+    const key1 = try saveCache(allocator, &cache, &store, io);
+    defer allocator.free(key1);
+    const key2 = try saveCache(allocator, &cache, &store, io);
+    defer allocator.free(key2);
+
+    try std.testing.expectEqualStrings(key1, key2);
 }
 
 test "wrapWithSavedAt injects field without disturbing schema body" {

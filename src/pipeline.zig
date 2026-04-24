@@ -12,6 +12,7 @@ const std = @import("std");
 const MpscQueue = @import("mpsc_queue.zig").MpscQueue;
 const ParquetWriter = @import("parquet_writer.zig").ParquetWriter;
 const parquet_writer = @import("parquet_writer.zig");
+const object_store = @import("object_store.zig");
 const RowJsonSerializer = @import("row_json_serializer.zig").RowJsonSerializer;
 const event_parser = @import("event_parser.zig");
 const metrics = @import("metrics.zig");
@@ -195,6 +196,9 @@ pub const Pipeline = struct {
     flush_thread: ?std.Thread,
     batch_size: usize,
     output_dir: []const u8,
+    /// Storage backend for parquet writes. Today a PosixStore rooted at
+    /// `output_dir`; Track 3 swaps in an S3Store when Lambda wiring lands.
+    store: object_store.ObjectStore,
     current_binlog_file: []const u8,
     processing_metrics: PipelineMetrics,
     flush_metrics: PipelineMetrics,
@@ -219,13 +223,20 @@ pub const Pipeline = struct {
             .flush_thread = null,
             .batch_size = batch_size,
             .output_dir = try allocator.dupe(u8, output_dir),
+            // Store is initialized below after `output_dir` is duped so its
+            // `root_dir` slice has the Pipeline's lifetime.
+            .store = undefined,
             .current_binlog_file = try allocator.dupe(u8, initial_binlog_file),
             .processing_metrics = .{},
             .flush_metrics = .{},
             .boolean_encoding = boolean_encoding,
         };
+        self.store = .{ .posix = object_store.PosixStore.init(allocator, self.output_dir) };
 
-        // Ensure output directory exists
+        // Ensure output directory exists. PosixStore also lazy-creates
+        // parent dirs, but doing it eagerly here preserves the UX of
+        // "output_dir exists as soon as the pipeline is initialized,"
+        // useful when operators watch the directory.
         const dir_z = allocator.dupeZ(u8, output_dir) catch |err| {
             log.warn("could not alloc dir path '{s}': {}", .{ output_dir, err });
             return err;
@@ -480,13 +491,15 @@ pub const Pipeline = struct {
     }
 
     fn openParquetFile(self: *Pipeline) !ParquetWriter {
-        // Build path: output_dir/binlog_file.parquet
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.parquet", .{
-            self.output_dir, self.current_binlog_file,
+        // Key is relative to the ObjectStore's root (= output_dir); the
+        // binlog filename is the key stem. No output_dir prefix here —
+        // that's the store's job.
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.parquet", .{
+            self.current_binlog_file,
         });
-        defer self.allocator.free(path);
+        defer self.allocator.free(key);
 
-        log.info("opening parquet file: {s}", .{path});
-        return ParquetWriter.init(self.allocator, path);
+        log.info("opening parquet file: {s}/{s}", .{ self.output_dir, key });
+        return ParquetWriter.init(self.allocator, &self.store, key);
     }
 };

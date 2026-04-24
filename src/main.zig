@@ -34,6 +34,8 @@ const binlog_reader = @import("binlog_reader.zig");
 const pipeline_mod = @import("pipeline.zig");
 const event_parser = @import("event_parser.zig");
 const log_config = @import("log_config.zig");
+const prereq_check = @import("prereq_check.zig");
+const object_store = @import("object_store.zig");
 
 const schema_cache_mod = @import("schema_cache.zig");
 const cache_persistence = @import("cache_persistence.zig");
@@ -147,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Load configuration
     log.info("loading configuration from: {s}", .{cfg_path});
-    const config = config_mod.Config.loadFromFile(allocator, cfg_path) catch |err| {
+    var config = config_mod.Config.loadFromFile(allocator, cfg_path) catch |err| {
         log.err("failed to load configuration: {}", .{err});
         return err;
     };
@@ -193,6 +195,32 @@ pub fn main(init: std.process.Init) !void {
     };
     log.debug("connection is alive", .{});
 
+    // Cold-start prerequisite checks: server config (hard fail on bad
+    // binlog_format/row_image), grants (soft warn), and binlog position
+    // validation (graceful adjust to oldest available if the requested
+    // file is missing). See plans/01-myzql-binlog-connector.md step 7.
+    log.info("running prerequisite checks", .{});
+    const prereq = prereq_check.run(
+        allocator,
+        &conn,
+        config.from_binlog_file,
+        config.from_binlog_position,
+    ) catch |err| {
+        log.err("prerequisite check failed: {}", .{err});
+        return err;
+    };
+    if (prereq.adjusted) {
+        log.warn(
+            "start position adjusted: {s}:{d} -> {s}:{d}",
+            .{ config.from_binlog_file, config.from_binlog_position, prereq.file, prereq.position },
+        );
+        config.from_binlog_file = prereq.file;
+        config.from_binlog_position = prereq.position;
+    } else {
+        // prereq.file is a dupe of the already-owned config.from_binlog_file;
+        // nothing to wire, arena will reclaim it on exit.
+    }
+
     // Create secondary connection for DESCRIBE queries (column name resolution)
     var describe_conn_opt: ?connection.Connection = blk: {
         log.info("opening secondary connection for schema queries", .{});
@@ -219,7 +247,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Load schema cache from disk if configured
     if (config.schema_cache_dir) |cache_dir| {
-        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, cache_dir, config.schema_cache_ttl_seconds, init.io) catch 0;
+        var cache_store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, cache_dir) };
+        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, &cache_store, config.schema_cache_ttl_seconds, init.io) catch 0;
         if (loaded > 0) {
             log.info("loaded {d} table schemas from cache", .{loaded});
         }
@@ -344,8 +373,9 @@ pub fn main(init: std.process.Init) !void {
     // Save schema cache before shutdown
     if (config.schema_cache_dir) |cache_dir| {
         if (reader.schema_cache.count() > 0) {
-            if (cache_persistence.saveCache(allocator, &reader.schema_cache, cache_dir, init.io)) |path| {
-                allocator.free(path);
+            var cache_store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, cache_dir) };
+            if (cache_persistence.saveCache(allocator, &reader.schema_cache, &cache_store, init.io)) |key| {
+                allocator.free(key);
             } else |err| {
                 log.warn("failed to save schema cache: {}", .{err});
             }
