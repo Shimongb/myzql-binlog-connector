@@ -17,6 +17,8 @@ pub const ddl_handler = @import("ddl_handler.zig");
 pub const cache_persistence = @import("cache_persistence.zig");
 pub const prereq_check = @import("prereq_check.zig");
 pub const object_store = @import("object_store.zig");
+pub const state = @import("state.zig");
+pub const config = @import("config.zig");
 
 test "root module" {
     // Placeholder test
@@ -30,4 +32,6 @@ comptime {
     _ = cache_persistence;
     _ = prereq_check;
     _ = object_store;
+    _ = state;
+    _ = config;
 }

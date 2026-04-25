@@ -6,7 +6,11 @@
 #   * CREATE / ALTER ADD COLUMN / RENAME TABLE mid-run
 #   * Connector bounded by SHOW MASTER STATUS position
 #   * Named columns + ENUM label resolution in stdout output
-#   * Schema cache persistence (cold write → warm load)
+#   * Schema cache persistence (write on cold parquet run → load on
+#     resume run via checkpoint key, post-Step-4)
+#   * Resume from `last_checkpoint.json` after a clean shutdown — second
+#     run skips already-processed events and picks up exactly where the
+#     prior run stopped.
 #
 # Usage:
 #   ./docker/integration_test.sh            # run then tear down
@@ -172,9 +176,10 @@ FIRST_BINLOG=$("${MYSQL_EXEC[@]}" -N -B -e "SHOW BINARY LOGS" | head -1 | awk '{
 echo "==> Starting from $FIRST_BINLOG:4"
 
 # ----------------------------------------------------------------
-# 4. Build + run connector (cold — no prior cache).
+# 4. Build + run1 (cold stdout, no output_dir = no state files).
+#    Tests stdout column-name and ENUM-label rendering only — the
+#    state-file path is exercised in run2 + run3 below.
 # ----------------------------------------------------------------
-CACHE_DIR="$TMPDIR/cache"
 CONFIG="$TMPDIR/integration.config.json"
 cat >"$CONFIG" <<EOF
 {
@@ -189,7 +194,6 @@ cat >"$CONFIG" <<EOF
   "to_binlog_file": "$BINLOG_FILE",
   "to_binlog_position": $BINLOG_POS,
   "output_mode": "stdout",
-  "schema_cache_dir": "$CACHE_DIR",
   "log_level": "info"
 }
 EOF
@@ -198,7 +202,7 @@ echo "==> Building connector..."
 (cd "$REPO_DIR" && zig build) >/dev/null
 
 RUN1="$TMPDIR/run1.log"
-echo "==> Running connector (cold)..."
+echo "==> Running connector run1 (cold stdout, no output_dir)..."
 "$REPO_DIR/zig-out/bin/myzql_binlog_connector" "$CONFIG" >"$RUN1" 2>&1 || {
   echo "connector exited non-zero; tail of output:" >&2
   tail -40 "$RUN1" >&2
@@ -206,7 +210,7 @@ echo "==> Running connector (cold)..."
 }
 
 # ----------------------------------------------------------------
-# 5. Assertions on cold run.
+# 5. Assertions on run1 (stdout).
 # ----------------------------------------------------------------
 echo "==> Asserting column names appear by name (not c0/c1)..."
 grep -q "label:" "$RUN1" || fail "column 'label' not found in output"
@@ -220,29 +224,12 @@ grep -qE 'kind:\s*"(alpha|beta|gamma)"' "$RUN1" || {
   fail "ENUM label not rendered"
 }
 
-echo "==> Asserting schema cache was written..."
-# Content-addressable layout: <cache_dir>/schema-cache/<16-hex-hash>.json.gz
-# with a .schema_cache_latest pointer at the cache dir root. Pointer file
-# will retire in Step 4 when the binlog checkpoint carries the key.
-shopt -s nullglob
-caches=("$CACHE_DIR"/schema-cache/*.json.gz)
-shopt -u nullglob
-[ ${#caches[@]} -gt 0 ] || fail "no schema-cache/*.json.gz files in $CACHE_DIR"
-[ -f "$CACHE_DIR/.schema_cache_latest" ] || fail ".schema_cache_latest pointer missing"
-
-# Verify the cache file really is gzipped (first two bytes = 1f 8b).
-hdr=$(xxd -p -l 2 "${caches[0]}")
-[ "$hdr" = "1f8b" ] || fail "cache file doesn't start with gzip magic (got $hdr)"
-
 # ----------------------------------------------------------------
-# 6. Warm run in parquet mode — exercises both (a) warm cache load
-#    and (b) the parquet-serialization path end-to-end, including
-#    the canary table above. The connector writes `.parquet` files
-#    per binlog file into `$PARQUET_DIR`; we read them back with
-#    DuckDB and assert per-type round-trips.
+# 6. run2 — cold parquet with output_dir set. Writes parquet output
+#    AND state/cache so run3 below can resume.
 # ----------------------------------------------------------------
-PARQUET_DIR="$TMPDIR/parquet"
-mkdir -p "$PARQUET_DIR"
+OUTPUT_DIR="$TMPDIR/output"
+mkdir -p "$OUTPUT_DIR"
 PARQUET_CONFIG="$TMPDIR/integration.parquet.config.json"
 cat >"$PARQUET_CONFIG" <<EOF
 {
@@ -257,31 +244,63 @@ cat >"$PARQUET_CONFIG" <<EOF
   "to_binlog_file": "$BINLOG_FILE",
   "to_binlog_position": $BINLOG_POS,
   "output_mode": "parquet",
-  "parquet_output_dir": "$PARQUET_DIR",
+  "output_dir": "$OUTPUT_DIR",
   "parquet_batch_size": 100,
-  "schema_cache_dir": "$CACHE_DIR",
   "log_level": "info"
 }
 EOF
 
 RUN2="$TMPDIR/run2.log"
-echo "==> Running connector (warm + parquet)..."
+echo "==> Running connector run2 (cold parquet with output_dir)..."
 "$REPO_DIR/zig-out/bin/myzql_binlog_connector" "$PARQUET_CONFIG" >"$RUN2" 2>&1 || {
-  echo "warm connector exited non-zero; tail:" >&2
+  echo "run2 exited non-zero; tail:" >&2
   tail -40 "$RUN2" >&2
   exit 1
 }
-grep -q "loaded .* table schemas from cache" "$RUN2" || {
-  echo "  relevant lines:" >&2
-  grep -E "(schema_cache|loaded)" "$RUN2" | tail -10 >&2
-  fail "warm run did not load schemas from cache"
-}
+
+# ----------------------------------------------------------------
+# 6a. Schema cache + state file assertions on run2.
+# ----------------------------------------------------------------
+echo "==> Asserting schema cache was written..."
+# Content-addressable layout: <output_dir>/ddl-cache/schema-cache/<16-hex-hash>.json.gz
+# (the inner schema-cache/ prefix is the cache module's namespace under
+# the ddl-cache/ subdir; the latest-pointer file was retired in Step 4 —
+# the binlog checkpoint carries the cache key now.)
+shopt -s nullglob
+caches=("$OUTPUT_DIR"/ddl-cache/schema-cache/*.json.gz)
+shopt -u nullglob
+[ ${#caches[@]} -gt 0 ] || fail "no ddl-cache/schema-cache/*.json.gz files in $OUTPUT_DIR"
+[ ! -f "$OUTPUT_DIR/ddl-cache/.schema_cache_latest" ] || fail ".schema_cache_latest pointer should not exist after Step 4 (latest pointer retired)"
+
+# Verify the cache file really is gzipped (first two bytes = 1f 8b).
+hdr=$(xxd -p -l 2 "${caches[0]}")
+[ "$hdr" = "1f8b" ] || fail "cache file doesn't start with gzip magic (got $hdr)"
+
+echo "==> Asserting last_checkpoint.json was written..."
+CHECKPOINT="$OUTPUT_DIR/state/last_checkpoint.json"
+[ -f "$CHECKPOINT" ] || fail "checkpoint not written at $CHECKPOINT"
+
+# Sanity-check the checkpoint contents — final position should match
+# our bounded stop, and is_in_progress must be false.
+python3 -c "
+import json, sys
+with open('$CHECKPOINT') as f: s = json.load(f)
+assert s['binlog_file'] == '$BINLOG_FILE', f\"checkpoint file: {s['binlog_file']} != $BINLOG_FILE\"
+assert int(s['binlog_position']) == $BINLOG_POS, f\"checkpoint pos: {s['binlog_position']} != $BINLOG_POS\"
+assert s['is_in_progress'] is False, 'is_in_progress should be false on clean shutdown'
+assert s['schema_cache_key'], 'checkpoint should reference a cache key'
+assert s['schema_cache_key'].startswith('schema-cache/'), f\"unexpected key: {s['schema_cache_key']}\"
+print('  OK: checkpoint =', s['binlog_file'] + ':' + str(s['binlog_position']), 'cache_key =', s['schema_cache_key'])
+" || fail "checkpoint contents did not validate"
+
+echo "==> Asserting current.json was deleted on clean shutdown..."
+[ ! -f "$OUTPUT_DIR/state/current.json" ] || fail "current.json should not exist after clean shutdown"
 
 # Assert the parquet writer produced a non-empty file.
 shopt -s nullglob
-parquets=("$PARQUET_DIR"/*.parquet)
+parquets=("$OUTPUT_DIR/data"/*.parquet)
 shopt -u nullglob
-[ ${#parquets[@]} -gt 0 ] || fail "no *.parquet files in $PARQUET_DIR"
+[ ${#parquets[@]} -gt 0 ] || fail "no *.parquet files in $OUTPUT_DIR/data"
 for pq in "${parquets[@]}"; do
   [ -s "$pq" ] || fail "empty parquet file: $pq"
 done
@@ -316,7 +335,7 @@ else
                     ELSE 'FAIL canary_count=' || c END
         FROM (
           SELECT COUNT(DISTINCT json_extract_string(after_values, '\$.id')) AS c
-          FROM read_parquet('$PARQUET_DIR/*.parquet')
+          FROM read_parquet('$OUTPUT_DIR/data/*.parquet')
           WHERE table_name = 'canary_events' AND dml_type = 'INSERT'
         );
 
@@ -333,7 +352,7 @@ else
              AND json_extract_string(after_values, '\$.created_at') LIKE '2026-04-24 10:00:00.123%'
             THEN 'OK row1_types'
             ELSE 'FAIL row1_types: ' || after_values END
-        FROM read_parquet('$PARQUET_DIR/*.parquet')
+        FROM read_parquet('$OUTPUT_DIR/data/*.parquet')
         WHERE table_name = 'canary_events'
           AND json_extract_string(after_values, '\$.id') = '1';
 
@@ -347,7 +366,7 @@ else
              AND json_extract(after_values, '\$.note')::TEXT       = 'null'
             THEN 'OK row2_types'
             ELSE 'FAIL row2_types: ' || after_values END
-        FROM read_parquet('$PARQUET_DIR/*.parquet')
+        FROM read_parquet('$OUTPUT_DIR/data/*.parquet')
         WHERE table_name = 'canary_events'
           AND json_extract_string(after_values, '\$.id') = '2';
 
@@ -358,7 +377,7 @@ else
              AND json_extract(after_values, '\$.body')::TEXT     = 'null'
             THEN 'OK row3_types'
             ELSE 'FAIL row3_types: ' || after_values END
-        FROM read_parquet('$PARQUET_DIR/*.parquet')
+        FROM read_parquet('$OUTPUT_DIR/data/*.parquet')
         WHERE table_name = 'canary_events'
           AND json_extract_string(after_values, '\$.id') = '3';
 
@@ -368,7 +387,7 @@ else
              AND json_extract_string(after_values, '\$.payload.nested.b[0]') = 'true'
             THEN 'OK row4_nested_json'
             ELSE 'FAIL row4_nested_json: ' || after_values END
-        FROM read_parquet('$PARQUET_DIR/*.parquet')
+        FROM read_parquet('$OUTPUT_DIR/data/*.parquet')
         WHERE table_name = 'canary_events'
           AND json_extract_string(after_values, '\$.id') = '4';
     " >"$DUCK_OUT" 2>&1 || {
@@ -398,11 +417,93 @@ else
   grep '^OK ' "$DUCK_OUT" | sed 's/^/    /' || true
 fi
 
+# ----------------------------------------------------------------
+# 8. run3 — resume from checkpoint. Insert one fresh event, capture
+#    the new master position, run the connector again with no
+#    `from_binlog_*` set: it should resume from run2's checkpoint,
+#    process the single new event, and update the checkpoint.
+# ----------------------------------------------------------------
+echo "==> Inserting one event past run2's stop position to test resume..."
+"${MYSQL_EXEC[@]}" <<'SQL' >/dev/null
+INSERT INTO itest_renamed (id, label, note, kind) VALUES (5, 'fifth', 'after run2', 'beta');
+SQL
+
+# Capture the new master position so run3 has something to bound against.
+if NEW_POS=$("${MYSQL_EXEC[@]}" -N -B -e "SHOW BINARY LOG STATUS" 2>/dev/null); then
+  :
+else NEW_POS=$("${MYSQL_EXEC[@]}" -N -B -e "SHOW MASTER STATUS"); fi
+NEW_BINLOG_FILE=$(echo "$NEW_POS" | head -1 | awk '{print $1}')
+NEW_BINLOG_POS=$(echo "$NEW_POS" | head -1 | awk '{print $2}')
+[ -n "$NEW_BINLOG_FILE" ] && [ -n "$NEW_BINLOG_POS" ] || fail "could not capture post-run2 master status"
+
+# Sanity: the new position should be strictly past run2's stop.
+if [ "$NEW_BINLOG_FILE" = "$BINLOG_FILE" ]; then
+  [ "$NEW_BINLOG_POS" -gt "$BINLOG_POS" ] || fail "new pos ($NEW_BINLOG_POS) is not past run2 stop ($BINLOG_POS)"
+fi
+echo "==> run2 stop: $BINLOG_FILE:$BINLOG_POS  ->  run3 stop: $NEW_BINLOG_FILE:$NEW_BINLOG_POS"
+
+# run3 config: no from_binlog_*; checkpoint must drive the start.
+RESUME_CONFIG="$TMPDIR/integration.resume.config.json"
+cat >"$RESUME_CONFIG" <<EOF
+{
+  "host": "127.0.0.1",
+  "port": 23306,
+  "user": "myzql_repl_user",
+  "password": "ReplPass2025",
+  "database": "testdb",
+  "ssl": true,
+  "to_binlog_file": "$NEW_BINLOG_FILE",
+  "to_binlog_position": $NEW_BINLOG_POS,
+  "output_mode": "stdout",
+  "output_dir": "$OUTPUT_DIR",
+  "log_level": "info"
+}
+EOF
+
+RUN3="$TMPDIR/run3.log"
+echo "==> Running connector run3 (resume from checkpoint)..."
+"$REPO_DIR/zig-out/bin/myzql_binlog_connector" "$RESUME_CONFIG" >"$RUN3" 2>&1 || {
+  echo "run3 exited non-zero; tail:" >&2
+  tail -40 "$RUN3" >&2
+  exit 1
+}
+
+echo "==> Asserting resume from checkpoint log line..."
+grep -q "found last checkpoint: $BINLOG_FILE:$BINLOG_POS" "$RUN3" || {
+  echo "  relevant lines:" >&2
+  grep -E "checkpoint|MISSING_START_POSITION|bootstrap" "$RUN3" | tail -10 >&2
+  fail "run3 did not resume from checkpoint at $BINLOG_FILE:$BINLOG_POS"
+}
+
+echo "==> Asserting warm cache load via checkpoint key..."
+grep -q "loaded .* table schemas from cache" "$RUN3" || {
+  echo "  relevant lines:" >&2
+  grep -E "(schema_cache|loaded|cache)" "$RUN3" | tail -10 >&2
+  fail "run3 did not load schemas from cache"
+}
+
+echo "==> Asserting new event was processed in stdout..."
+grep -qE 'kind:\s*"beta"' "$RUN3" || {
+  echo "  last 20 stdout lines:" >&2
+  tail -20 "$RUN3" >&2
+  fail "run3 did not render the post-run2 event"
+}
+
+echo "==> Asserting checkpoint advanced to new position..."
+python3 -c "
+import json
+with open('$CHECKPOINT') as f: s = json.load(f)
+assert s['binlog_file'] == '$NEW_BINLOG_FILE', f\"file: {s['binlog_file']} != $NEW_BINLOG_FILE\"
+assert int(s['binlog_position']) == $NEW_BINLOG_POS, f\"pos: {s['binlog_position']} != $NEW_BINLOG_POS\"
+assert s['is_in_progress'] is False
+print('  OK: checkpoint advanced to', s['binlog_file'] + ':' + str(s['binlog_position']))
+" || fail "checkpoint did not advance to run3 stop position"
+
 echo ""
 echo "==============================================="
 echo "  Integration test PASSED"
-echo "  Cold stdout run log: $RUN1"
-echo "  Warm parquet run log: $RUN2"
-echo "  Cache dir:    $CACHE_DIR"
-echo "  Parquet dir:  $PARQUET_DIR"
+echo "  run1 (cold stdout) log:        $RUN1"
+echo "  run2 (cold parquet) log:       $RUN2"
+echo "  run3 (warm resume) log:        $RUN3"
+echo "  output_dir (state+cache+data): $OUTPUT_DIR"
 echo "==============================================="

@@ -11,11 +11,22 @@
 //!   "user": "dba",                                 // Optional: MySQL username
 //!   "password": "",                                // Optional: MySQL password
 //!   "database": "dba",                             // Optional: Initial database
-//!   "from_binlog_file": "mysql-bin-changelog.202341",
-//!   "from_binlog_position": 4,                     // Start position (4 = beginning)
+//!   "from_binlog_file": "mysql-bin.000001",        // Optional: start file (genesis)
+//!   "from_binlog_position": 4,                     // Optional: start position
 //!   "to_binlog_file": null,                        // Optional: Stop at this file
-//!   "to_binlog_position": null                     // Optional: Stop at this position
+//!   "to_binlog_position": null,                    // Optional: Stop at this position
+//!   "output_dir": "./output"                       // Optional: state + cache + parquet root
 //! }
+//!
+//! `output_dir` layout (when set):
+//!   {output_dir}/state/        — current.json + last_checkpoint.json
+//!   {output_dir}/ddl-cache/    — schema cache (gzipped JSON, content-addressable)
+//!   {output_dir}/data/         — parquet output (when output_mode = parquet)
+//!
+//! `from_binlog_*` is the genesis position used only when no checkpoint
+//! exists. Once a `last_checkpoint.json` is written, subsequent runs
+//! resume from it and ignore `from_binlog_*`. To force a restart from
+//! config, delete `{output_dir}/state/last_checkpoint.json`.
 //!
 //! === MEMORY MANAGEMENT ===
 //!
@@ -33,6 +44,20 @@ const std = @import("std");
 pub const table_filter = @import("table_filter.zig");
 
 const log = std.log.scoped(.config);
+
+/// Subdirectory layout under `output_dir`. Constants (not configurable)
+/// so all three concerns share a single root and stay coupled — losing
+/// one without the others would corrupt the resume contract (e.g. cache
+/// files orphaned without their checkpoint key).
+pub const STATE_SUBDIR = "state";
+pub const DDL_CACHE_SUBDIR = "ddl-cache";
+pub const DATA_SUBDIR = "data";
+
+/// Default lock-staleness threshold in milliseconds. 90s matches the
+/// Lambda-cadence design point: an invocation that hasn't refreshed
+/// `current.json` within 90s is presumed crashed. Configurable via
+/// `current_state_staleness_ms`.
+pub const DEFAULT_CURRENT_STATE_STALENESS_MS: i64 = 90_000;
 
 /// Output mode for the connector
 pub const OutputMode = enum {
@@ -114,19 +139,36 @@ pub const Config = struct {
     // === Connection Settings ===
     host: []const u8,
     port: u16,
-    user: ?[]const u8,
-    password: ?[]const u8,
-    database: ?[]const u8,
+    user: ?[]const u8 = null,
+    password: ?[]const u8 = null,
+    database: ?[]const u8 = null,
 
     // === Binlog Position Settings ===
-    from_binlog_file: []const u8,
-    from_binlog_position: u64,
-    to_binlog_file: ?[]const u8,
-    to_binlog_position: ?u64,
+    /// Genesis start file. Used only when no checkpoint exists at runtime.
+    /// Once `{output_dir}/state/last_checkpoint.json` is written, this is
+    /// ignored on subsequent runs.
+    from_binlog_file: ?[]const u8 = null,
+    /// Genesis start position. Same caveat as `from_binlog_file`.
+    from_binlog_position: ?u64 = null,
+    to_binlog_file: ?[]const u8 = null,
+    to_binlog_position: ?u64 = null,
+    /// Auto-bound the run when `to_binlog_*` is unset: query master
+    /// position at init and use it as the ceiling. Default `true` —
+    /// matches the Lambda-shape "catch up to where master was when we
+    /// started, then exit cleanly" model. Local-CLI users who want
+    /// forever-streaming should set this to `false`. When `to_binlog_*`
+    /// is explicitly set in config, this flag has no effect.
+    bound_to_master_at_init: bool = true,
 
     // === Output Settings ===
     output_mode: OutputMode = .stdout,
-    parquet_output_dir: ?[]const u8 = null,
+    /// Root directory for state files, schema cache, and (when output_mode
+    /// = parquet) parquet output. See `STATE_SUBDIR`/`DDL_CACHE_SUBDIR`/
+    /// `DATA_SUBDIR` for the layout.
+    /// - Required when `output_mode = parquet`.
+    /// - Optional when `output_mode = stdout`. If null, no state files
+    ///   and no schema cache are persisted (every run is a cold start).
+    output_dir: ?[]const u8 = null,
     parquet_batch_size: u32 = 8192,
     pipeline_queue_capacity: u32 = 32,
     boolean_encoding: BooleanEncoding = .auto_bool,
@@ -137,7 +179,6 @@ pub const Config = struct {
     exclude: ?[]const []const u8 = null,
 
     // === Schema Cache Settings ===
-    schema_cache_dir: ?[]const u8 = null,
     /// Staleness threshold for the persisted schema cache, in seconds.
     /// Checked once at bootstrap against the cache file's storage-layer
     /// mtime (local fstat now; S3 HEAD Last-Modified when that backend
@@ -145,6 +186,12 @@ pub const Config = struct {
     /// is trusted. A recommended starting value is ~6h; shorter for
     /// DDL-heavy sources, longer for stable schemas.
     schema_cache_ttl_seconds: ?u64 = null,
+
+    // === State File Settings ===
+    /// Lock-staleness threshold for `current.json`, in milliseconds.
+    /// `current.json` older than this is presumed-crashed and the next
+    /// run resumes from `last_checkpoint.json`.
+    current_state_staleness_ms: i64 = DEFAULT_CURRENT_STATE_STALENESS_MS,
 
     // === SSL/TLS Settings ===
     ssl: bool = true,
@@ -227,56 +274,70 @@ pub const Config = struct {
             return ConfigError.InvalidPort;
         }
 
-        // Validate binlog settings
-        if (self.from_binlog_file.len == 0) {
-            log.err("validation: from_binlog_file cannot be empty", .{});
+        // Validate binlog start position — both-or-neither, since either alone
+        // is ambiguous (file without position vs position without file).
+        if ((self.from_binlog_file == null) != (self.from_binlog_position == null)) {
+            log.err("validation: from_binlog_file and from_binlog_position must be set together (or both omitted)", .{});
             return ConfigError.InvalidBinlogFile;
         }
-
-        // MySQL binlog format: first 4 bytes are magic number (0xfe 0x62 0x69 0x6e)
-        // Position 4 is the start of actual binlog events
-        if (self.from_binlog_position < 4) {
-            log.err("validation: from_binlog_position must be >= 4 (binlog header size)", .{});
-            return ConfigError.InvalidBinlogPosition;
+        if (self.from_binlog_file) |f| {
+            if (f.len == 0) {
+                log.err("validation: from_binlog_file cannot be empty when set", .{});
+                return ConfigError.InvalidBinlogFile;
+            }
+        }
+        if (self.from_binlog_position) |p| {
+            // MySQL binlog format: first 4 bytes are magic (0xfe 0x62 0x69 0x6e).
+            // Position 4 is the first byte of the first real event.
+            if (p < 4) {
+                log.err("validation: from_binlog_position must be >= 4 (binlog header size)", .{});
+                return ConfigError.InvalidBinlogPosition;
+            }
         }
 
-        // If end position is specified, validate it makes sense
+        // If end position is specified, validate it makes sense relative to
+        // any genesis start. (We can't validate against a runtime-resolved
+        // position; the connector does another sanity pass at init.)
         if (self.to_binlog_position) |end_pos| {
-            // If we have a to_binlog_file, check if it's different from from_binlog_file
-            if (self.to_binlog_file) |to_file| {
-                if (std.mem.eql(u8, to_file, self.from_binlog_file)) {
-                    // Same file: position must be greater
-                    if (end_pos <= self.from_binlog_position) {
-                        log.err("validation: to_binlog_position must be greater than from_binlog_position when using the same file", .{});
-                        return ConfigError.InvalidBinlogPosition;
+            if (self.from_binlog_file) |from_file| {
+                const from_pos = self.from_binlog_position.?;
+                if (self.to_binlog_file) |to_file| {
+                    if (std.mem.eql(u8, to_file, from_file)) {
+                        if (end_pos <= from_pos) {
+                            log.err("validation: to_binlog_position must be greater than from_binlog_position when using the same file", .{});
+                            return ConfigError.InvalidBinlogPosition;
+                        }
+                    } else {
+                        const from_num = extractBinlogFileNumber(from_file) orelse {
+                            log.err("validation: cannot extract file number from '{s}'", .{from_file});
+                            return ConfigError.InvalidBinlogFile;
+                        };
+                        const to_num = extractBinlogFileNumber(to_file) orelse {
+                            log.err("validation: cannot extract file number from '{s}'", .{to_file});
+                            return ConfigError.InvalidBinlogFile;
+                        };
+                        if (to_num < from_num) {
+                            log.err("validation: to_binlog_file number ({d}) must be >= from_binlog_file number ({d})", .{ to_num, from_num });
+                            return ConfigError.InvalidBinlogFile;
+                        }
+                        if (to_num == from_num) {
+                            log.err("validation: file numbers are the same ({d}) but filenames differ", .{from_num});
+                            return ConfigError.InvalidBinlogFile;
+                        }
                     }
                 } else {
-                    // Different files: extract file numbers and compare
-                    const from_num = extractBinlogFileNumber(self.from_binlog_file) orelse {
-                        log.err("validation: cannot extract file number from '{s}'", .{self.from_binlog_file});
-                        return ConfigError.InvalidBinlogFile;
-                    };
-                    const to_num = extractBinlogFileNumber(to_file) orelse {
-                        log.err("validation: cannot extract file number from '{s}'", .{to_file});
-                        return ConfigError.InvalidBinlogFile;
-                    };
-
-                    if (to_num < from_num) {
-                        log.err("validation: to_binlog_file number ({d}) must be >= from_binlog_file number ({d})", .{ to_num, from_num });
-                        return ConfigError.InvalidBinlogFile;
+                    if (end_pos <= from_pos) {
+                        log.err("validation: to_binlog_position must be greater than from_binlog_position", .{});
+                        return ConfigError.InvalidBinlogPosition;
                     }
-                    if (to_num == from_num) {
-                        log.err("validation: file numbers are the same ({d}) but filenames differ", .{from_num});
-                        return ConfigError.InvalidBinlogFile;
-                    }
-                }
-            } else {
-                // No to_file specified but has position - this means same file
-                if (end_pos <= self.from_binlog_position) {
-                    log.err("validation: to_binlog_position must be greater than from_binlog_position", .{});
-                    return ConfigError.InvalidBinlogPosition;
                 }
             }
+        }
+
+        // Parquet mode requires output_dir; stdout mode allows it to be null.
+        if (self.output_mode == .parquet and self.output_dir == null) {
+            log.err("validation: output_mode=parquet requires output_dir", .{});
+            return ConfigError.InvalidFilter;
         }
 
         // Validate table filter patterns (if any)
@@ -304,20 +365,26 @@ pub const Config = struct {
             if (self.database) |db| db else "(none)",
         });
 
-        if (self.to_binlog_file) |to_file| {
-            if (self.to_binlog_position) |to_pos| {
-                log.info("binlog range: {s}:{d} -> {s}:{d}", .{ self.from_binlog_file, self.from_binlog_position, to_file, to_pos });
+        const from_label: []const u8 = if (self.from_binlog_file) |f| f else "(unset — resolved at runtime)";
+        if (self.from_binlog_file != null) {
+            const from_pos = self.from_binlog_position.?;
+            if (self.to_binlog_file) |to_file| {
+                if (self.to_binlog_position) |to_pos| {
+                    log.info("genesis binlog range: {s}:{d} -> {s}:{d}", .{ from_label, from_pos, to_file, to_pos });
+                } else {
+                    log.info("genesis binlog range: {s}:{d} -> {s}:END", .{ from_label, from_pos, to_file });
+                }
             } else {
-                log.info("binlog range: {s}:{d} -> {s}:END", .{ self.from_binlog_file, self.from_binlog_position, to_file });
+                log.info("genesis binlog range: {s}:{d} -> (latest)", .{ from_label, from_pos });
             }
         } else {
-            log.info("binlog range: {s}:{d} -> (latest)", .{ self.from_binlog_file, self.from_binlog_position });
+            log.info("genesis binlog range: {s} (will resume from checkpoint or query master)", .{from_label});
         }
 
         log.info("output mode: {s}", .{@tagName(self.output_mode)});
+        log.info("output_dir: {s}", .{self.output_dir orelse "(none — no state, no cache)"});
         if (self.output_mode == .parquet) {
-            log.info("parquet: dir={s} batch_size={d} queue_capacity={d} boolean_encoding={s}", .{
-                self.parquet_output_dir orelse "(default)",
+            log.info("parquet: batch_size={d} queue_capacity={d} boolean_encoding={s}", .{
                 self.parquet_batch_size,
                 self.pipeline_queue_capacity,
                 @tagName(self.boolean_encoding),
@@ -337,7 +404,7 @@ pub const Config = struct {
     }
 };
 
-test "config parsing" {
+test "config parsing with from_binlog_* set" {
     const allocator = std.testing.allocator;
 
     const json_data =
@@ -361,5 +428,36 @@ test "config parsing" {
     const config = parsed.value;
     try std.testing.expectEqualStrings("127.0.0.1", config.host);
     try std.testing.expectEqual(@as(u16, 15010), config.port);
-    try std.testing.expectEqual(@as(u64, 4), config.from_binlog_position);
+    try std.testing.expectEqualStrings("mysql-bin-changelog.202341", config.from_binlog_file.?);
+    try std.testing.expectEqual(@as(u64, 4), config.from_binlog_position.?);
+    try config.validate();
 }
+
+test "config parsing without from_binlog_* (resolved at runtime)" {
+    const allocator = std.testing.allocator;
+
+    const json_data =
+        \\{
+        \\  "host": "127.0.0.1",
+        \\  "port": 15010
+        \\}
+    ;
+
+    const parsed = try std.json.parseFromSlice(Config, allocator, json_data, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const config = parsed.value;
+    try std.testing.expectEqual(@as(?[]const u8, null), config.from_binlog_file);
+    try std.testing.expectEqual(@as(?u64, null), config.from_binlog_position);
+    try config.validate();
+}
+
+// Validation error-path coverage (from_*-both-or-neither, parquet-without-
+// output_dir) is exercised by the integration test rather than unit tests
+// — those rules `log.err` for operators, and Zig 0.16's test runner flags
+// any `err`-level log as a test failure. Lowering the log level would
+// change operator-facing UX, so the rejection paths live with the
+// integration test instead.

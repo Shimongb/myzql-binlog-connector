@@ -64,9 +64,19 @@ pub const BinlogReader = struct {
     table_filter: ?TableFilter,
     tables_filtered: u64,
 
-    /// Initialize binlog reader with a connection and optional secondary connection for DESCRIBE
-    pub fn init(allocator: std.mem.Allocator, conn: *connection.Connection, config: Config, describe_conn: ?*connection.Connection) !BinlogReader {
-        const binlog_file_copy = try allocator.dupe(u8, config.from_binlog_file);
+    /// Initialize binlog reader with a connection and optional secondary
+    /// connection for DESCRIBE. `start_file`/`start_position` are the
+    /// resolved start position — caller (main.zig) decides whether they
+    /// come from a checkpoint, config, or `SHOW MASTER STATUS`.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        conn: *connection.Connection,
+        config: Config,
+        describe_conn: ?*connection.Connection,
+        start_file: []const u8,
+        start_position: u64,
+    ) !BinlogReader {
+        const binlog_file_copy = try allocator.dupe(u8, start_file);
         errdefer allocator.free(binlog_file_copy);
 
         // Build table filter if include/exclude patterns are configured
@@ -81,7 +91,7 @@ pub const BinlogReader = struct {
             .config = config,
             .events_read = 0,
             .current_binlog_file = binlog_file_copy,
-            .current_position = config.from_binlog_position,
+            .current_position = start_position,
             .table_cache = std.AutoHashMap(u64, event_parser.TableMetadata).init(allocator),
             .format_description = null,
             .schema_cache = SchemaCache.init(allocator, describe_conn),
@@ -104,11 +114,13 @@ pub const BinlogReader = struct {
         }
     }
 
-    /// Open binlog stream at specified position
+    /// Open binlog stream at the reader's current position. The position
+    /// was set in `init` from caller-supplied `start_file`/`start_position`
+    /// args (resolved from checkpoint, config, or master query).
     pub fn open(self: *BinlogReader) !void {
         log.info("opening binlog stream: {s}:{d}", .{
-            self.config.from_binlog_file,
-            self.config.from_binlog_position,
+            self.current_binlog_file,
+            self.current_position,
         });
 
         // Enable checksum support
@@ -125,8 +137,8 @@ pub const BinlogReader = struct {
         const cmd = BinlogDumpCommand{
             .binlog_flags = 0, // Block until event available
             .server_id = 1, // Client server_id (should be unique)
-            .binlog_filename = self.config.from_binlog_file,
-            .binlog_position = @intCast(self.config.from_binlog_position),
+            .binlog_filename = self.current_binlog_file,
+            .binlog_position = @intCast(self.current_position),
         };
 
         // Manually serialize command into payload (ArrayList.writer removed in 0.16)
