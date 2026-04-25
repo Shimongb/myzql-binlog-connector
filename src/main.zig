@@ -36,11 +36,21 @@ const event_parser = @import("event_parser.zig");
 const log_config = @import("log_config.zig");
 const prereq_check = @import("prereq_check.zig");
 const object_store = @import("object_store.zig");
+const state_mod = @import("state.zig");
 
 const schema_cache_mod = @import("schema_cache.zig");
 const cache_persistence = @import("cache_persistence.zig");
 
 const log = std.log.scoped(.main);
+
+const CURRENT_KEY = "current.json";
+const CHECKPOINT_KEY = "last_checkpoint.json";
+
+/// Current Unix milliseconds via the project's std.Io clock.
+fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Clock.now(.real, io);
+    return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
 
 /// Install custom log function with runtime level filtering.
 /// Set compile-time level to .debug so all levels pass through to our logFn,
@@ -195,16 +205,128 @@ pub fn main(init: std.process.Init) !void {
     };
     log.debug("connection is alive", .{});
 
+    // ====================================================================
+    // State init
+    //
+    // Order:
+    //   1. Resolve `state_dir` and `cache_dir` paths from config.output_dir.
+    //   2. checkLock(current.json) — exit gracefully if a fresh owner is live.
+    //   3. loadCheckpoint(last_checkpoint.json) — `?BinlogState`.
+    //   4. Resolve effective start position: checkpoint > config > master.
+    //   5. prereq_check on effective position (may adjust to oldest).
+    //   6. writeCurrentLock with adjusted position + new run_id.
+    //   7. BinlogReader.init with start_file/start_position.
+    //   8. loadCacheFromKey(checkpoint.schema_cache_key) if present + fresh.
+    // ====================================================================
+
+    var state_dir_path: ?[]const u8 = null;
+    var cache_dir_path: ?[]const u8 = null;
+    var data_dir_path: ?[]const u8 = null;
+    if (config.output_dir) |od| {
+        state_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.STATE_SUBDIR });
+        cache_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DDL_CACHE_SUBDIR });
+        data_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DATA_SUBDIR });
+    }
+
+    var state_store_opt: ?object_store.ObjectStore = null;
+    if (state_dir_path) |sdp| {
+        state_store_opt = .{ .posix = object_store.PosixStore.init(allocator, sdp) };
+    }
+
+    var cache_store_opt: ?object_store.ObjectStore = null;
+    if (cache_dir_path) |cdp| {
+        cache_store_opt = .{ .posix = object_store.PosixStore.init(allocator, cdp) };
+    }
+
+    // Inspect current.json. Skip the run if a live owner is detected.
+    var maybe_checkpoint: ?state_mod.BinlogState = null;
+    defer if (maybe_checkpoint) |s| s.deinit(allocator);
+
+    if (state_store_opt) |*store| {
+        log.info("checking for existing execution state at {s}/{s}", .{ state_dir_path.?, CURRENT_KEY });
+        const lock_check = state_mod.checkLock(
+            allocator,
+            store,
+            CURRENT_KEY,
+            config.current_state_staleness_ms,
+            nowMs(init.io),
+        ) catch |err| {
+            log.err("state checkLock failed: {}", .{err});
+            return err;
+        };
+        defer if (lock_check.prior_state) |s| s.deinit(allocator);
+
+        switch (lock_check.outcome) {
+            .acquired_fresh => log.info("no prior state — fresh execution", .{}),
+            .acquired_stale_predecessor => {
+                if (lock_check.prior_state) |s| {
+                    const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
+                    log.warn(
+                        "found stale state (run_id: {s}, age: {d}s); assuming crashed predecessor — will resume from checkpoint",
+                        .{ s.run_id, age_s },
+                    );
+                } else {
+                    log.warn("found malformed state file; assuming crashed predecessor — will resume from checkpoint", .{});
+                }
+            },
+            .skip_live_owner => {
+                if (lock_check.prior_state) |s| {
+                    const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
+                    log.warn(
+                        "found recent in-progress state (run_id: {s}, age: {d}s) — skipping execution to avoid duplication",
+                        .{ s.run_id, age_s },
+                    );
+                }
+                return;
+            },
+        }
+
+        // Load the durable checkpoint (independent of current.json).
+        maybe_checkpoint = state_mod.loadCheckpoint(allocator, store, CHECKPOINT_KEY) catch null;
+    }
+
+    // Resolve effective start position.
+    var effective_file: []const u8 = undefined;
+    var effective_pos: u64 = undefined;
+    if (maybe_checkpoint) |cp| {
+        effective_file = cp.binlog_file;
+        effective_pos = cp.binlog_position;
+        log.info(
+            "found last checkpoint: {s}:{d} — config.from_binlog_* values are ignored. Delete {s}/{s} to force restart from config.",
+            .{ cp.binlog_file, cp.binlog_position, state_dir_path.?, CHECKPOINT_KEY },
+        );
+    } else if (config.from_binlog_file) |cf| {
+        effective_file = cf;
+        effective_pos = config.from_binlog_position.?;
+        log.info("no checkpoint — bootstrapping from config: {s}:{d}", .{ effective_file, effective_pos });
+    } else {
+        log.info("no checkpoint and no config.from_binlog_*; querying master position", .{});
+        const mp = prereq_check.getMasterPosition(allocator, &conn) catch |err| {
+            log.err(
+                "[MISSING_START_POSITION] cannot determine binlog start position. Tried: (1) {s}/{s} (not found), (2) config.from_binlog_* (not set), (3) SHOW MASTER STATUS ({}). Set config.from_binlog_file/position or ensure binlog is enabled on the server.",
+                .{
+                    state_dir_path orelse "(state files disabled — set output_dir to enable resume)",
+                    CHECKPOINT_KEY,
+                    err,
+                },
+            );
+            return err;
+        };
+        log.info("bootstrapped from master position: {s}:{d}", .{ mp.file, mp.position });
+        effective_file = mp.file;
+        effective_pos = mp.position;
+    }
+
     // Cold-start prerequisite checks: server config (hard fail on bad
     // binlog_format/row_image), grants (soft warn), and binlog position
     // validation (graceful adjust to oldest available if the requested
-    // file is missing). See plans/01-myzql-binlog-connector.md step 7.
+    // file is missing).
     log.info("running prerequisite checks", .{});
     const prereq = prereq_check.run(
         allocator,
         &conn,
-        config.from_binlog_file,
-        config.from_binlog_position,
+        effective_file,
+        effective_pos,
     ) catch |err| {
         log.err("prerequisite check failed: {}", .{err});
         return err;
@@ -212,13 +334,48 @@ pub fn main(init: std.process.Init) !void {
     if (prereq.adjusted) {
         log.warn(
             "start position adjusted: {s}:{d} -> {s}:{d}",
-            .{ config.from_binlog_file, config.from_binlog_position, prereq.file, prereq.position },
+            .{ effective_file, effective_pos, prereq.file, prereq.position },
         );
-        config.from_binlog_file = prereq.file;
-        config.from_binlog_position = prereq.position;
-    } else {
-        // prereq.file is a dupe of the already-owned config.from_binlog_file;
-        // nothing to wire, arena will reclaim it on exit.
+    }
+
+    // Auto-bound the run with master pos as the ceiling, when:
+    //   * `bound_to_master_at_init` is true (default), AND
+    //   * neither `to_binlog_file` nor `to_binlog_position` is set in config.
+    // Hedges against accidental concurrent runs (a stale-lock-misread-as-
+    // crashed scenario only re-replays the already-captured range), and
+    if (config.bound_to_master_at_init and config.to_binlog_file == null and config.to_binlog_position == null) {
+        const ceiling = prereq_check.getMasterPosition(allocator, &conn) catch |err| blk: {
+            log.warn("bound_to_master_at_init: master query failed ({}); leaving run unbounded", .{err});
+            break :blk null;
+        };
+        if (ceiling) |c| {
+            log.info(
+                "bound_to_master_at_init: setting run ceiling to {s}:{d} (catch up + exit)",
+                .{ c.file, c.position },
+            );
+            config.to_binlog_file = c.file;
+            config.to_binlog_position = c.position;
+        }
+    }
+
+    // Claim the lock with the post-adjust position. Only happens after
+    // we've committed to running — prereq failures leave no stale lock.
+    var run_id: ?[]u8 = null;
+    if (state_store_opt) |*store| {
+        const id = try state_mod.generateRunId(allocator);
+        run_id = id;
+        const lock_state: state_mod.BinlogState = .{
+            .binlog_file = prereq.file,
+            .binlog_position = prereq.position,
+            .updated_at_ms = nowMs(init.io),
+            .run_id = id,
+            // Carry the predecessor's cache key forward — if we crash
+            // before writing a new cache, the next run still has a key.
+            .schema_cache_key = if (maybe_checkpoint) |cp| cp.schema_cache_key else null,
+            .is_in_progress = true,
+        };
+        try state_mod.writeCurrentLock(allocator, store, CURRENT_KEY, lock_state);
+        log.info("claimed lock at {s}/{s} (run_id: {s})", .{ state_dir_path.?, CURRENT_KEY, id });
     }
 
     // Create secondary connection for DESCRIBE queries (column name resolution)
@@ -239,18 +396,50 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (describe_conn_opt) |*dc| dc.disconnect();
 
-    // Initialize binlog reader with connection and config
+    // Initialize binlog reader with the resolved start position.
     log.info("starting binlog reader", .{});
     const describe_conn_ptr: ?*connection.Connection = if (describe_conn_opt) |*dc| dc else null;
-    var reader = try binlog_reader.BinlogReader.init(allocator, &conn, config, describe_conn_ptr);
+    var reader = try binlog_reader.BinlogReader.init(
+        allocator,
+        &conn,
+        config,
+        describe_conn_ptr,
+        prereq.file,
+        prereq.position,
+    );
     defer reader.deinit();
 
-    // Load schema cache from disk if configured
-    if (config.schema_cache_dir) |cache_dir| {
-        var cache_store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, cache_dir) };
-        const loaded = cache_persistence.loadCache(allocator, &reader.schema_cache, &cache_store, config.schema_cache_ttl_seconds, init.io) catch 0;
-        if (loaded > 0) {
-            log.info("loaded {d} table schemas from cache", .{loaded});
+    // Load schema cache by the key from the checkpoint (if any). TTL check
+    // is opt-in — if the cache key has aged past `schema_cache_ttl_seconds`,
+    // skip the load and cold-start the cache (position still resumes).
+    if (cache_store_opt) |*store| {
+        if (maybe_checkpoint) |cp| {
+            if (cp.schema_cache_key) |key| {
+                var skip_load = false;
+                if (config.schema_cache_ttl_seconds) |ttl| {
+                    if (store.head(key)) |info| {
+                        const now_secs = @divFloor(nowMs(init.io), std.time.ms_per_s);
+                        const mtime = @divFloor(info.last_modified_ms, std.time.ms_per_s);
+                        if (cache_persistence.isStaleByTtl(mtime, now_secs, ttl)) {
+                            log.warn(
+                                "schema cache key '{s}' is stale (age {d}s, TTL {d}s); cold-starting cache",
+                                .{ key, now_secs - mtime, ttl },
+                            );
+                            skip_load = true;
+                        }
+                    } else |err| switch (err) {
+                        object_store.Error.NotFound => {
+                            log.warn("checkpoint refers to missing cache key '{s}'; cold-starting cache", .{key});
+                            skip_load = true;
+                        },
+                        else => log.debug("store.head failed for '{s}' ({}); TTL check skipped", .{ key, err }),
+                    }
+                }
+                if (!skip_load) {
+                    const loaded = cache_persistence.loadCacheFromKey(allocator, &reader.schema_cache, store, key) catch 0;
+                    if (loaded > 0) log.info("loaded {d} table schemas from cache", .{loaded});
+                }
+            }
         }
     }
 
@@ -259,10 +448,10 @@ pub fn main(init: std.process.Init) !void {
         filter.logSummary();
     }
 
-    // Open binlog stream at configured position
+    // Open binlog stream at the resolved position.
     reader.open() catch |err| {
         log.err("failed to open binlog stream: {}", .{err});
-        log.err("troubleshooting: verify binlog file '{s}' exists, binlog is enabled, user has REPLICATION SLAVE privileges", .{config.from_binlog_file});
+        log.err("troubleshooting: verify binlog file '{s}' exists, binlog is enabled, user has REPLICATION SLAVE privileges", .{prereq.file});
         return err;
     };
     defer reader.close();
@@ -276,12 +465,13 @@ pub fn main(init: std.process.Init) !void {
             };
         },
         .parquet => {
-            const output_dir = config.parquet_output_dir orelse "./parquet_output";
+            // Validation guarantees output_dir is set when output_mode = parquet.
+            const parquet_dir = data_dir_path.?;
 
             var pipe = pipeline_mod.Pipeline.init(
                 gpa.allocator(),
-                output_dir,
-                config.from_binlog_file,
+                parquet_dir,
+                prereq.file,
                 config.parquet_batch_size,
                 config.pipeline_queue_capacity,
                 config.boolean_encoding,
@@ -370,16 +560,48 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    // Save schema cache before shutdown
-    if (config.schema_cache_dir) |cache_dir| {
+    // ====== CLEAN SHUTDOWN — Step 4 ======
+    // Order matters:
+    //   1. saveCache → returns the content-addressable cache key.
+    //   2. writeCheckpoint with final {file, position, cache_key}.
+    //   3. releaseLock (best-effort — failures are non-fatal).
+    //
+    // Failures in (1) or (2) propagate. (3) is best-effort because the
+    // next run's stale-detection handles a leftover lock anyway.
+    //
+    // Error paths above (any `return err`) deliberately skip both (2)
+    // and (3) — leaving current.json in place is the crash signal that
+    // tells the next run "predecessor died, resume from checkpoint."
+
+    var saved_cache_key: ?[]const u8 = null;
+    if (cache_store_opt) |*store| {
         if (reader.schema_cache.count() > 0) {
-            var cache_store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, cache_dir) };
-            if (cache_persistence.saveCache(allocator, &reader.schema_cache, &cache_store, init.io)) |key| {
-                allocator.free(key);
-            } else |err| {
-                log.warn("failed to save schema cache: {}", .{err});
-            }
+            saved_cache_key = cache_persistence.saveCache(allocator, &reader.schema_cache, store, init.io) catch |err| blk: {
+                log.warn("failed to save schema cache: {} — checkpoint will not reference a cache", .{err});
+                break :blk null;
+            };
         }
+    }
+
+    if (state_store_opt) |*store| {
+        const final_state: state_mod.BinlogState = .{
+            .binlog_file = reader.current_binlog_file,
+            .binlog_position = reader.current_position,
+            .updated_at_ms = nowMs(init.io),
+            .run_id = run_id.?,
+            .schema_cache_key = saved_cache_key,
+            .is_in_progress = false,
+        };
+        state_mod.writeCheckpoint(allocator, store, CHECKPOINT_KEY, final_state) catch |err| {
+            log.err("failed to write checkpoint: {}", .{err});
+            return err;
+        };
+        log.info(
+            "wrote checkpoint at {s}/{s}: {s}:{d}",
+            .{ state_dir_path.?, CHECKPOINT_KEY, reader.current_binlog_file, reader.current_position },
+        );
+
+        state_mod.releaseLock(store, CURRENT_KEY);
     }
 
     // Summary

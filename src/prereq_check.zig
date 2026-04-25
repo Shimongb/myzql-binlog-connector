@@ -24,6 +24,16 @@ pub const Error = error{
     BinlogFormatNotRow,
     BinlogRowImageNotFull,
     NoBinlogsAvailable,
+    /// `SHOW MASTER STATUS` returned zero rows or unparseable data —
+    /// usually means binlog is disabled on the server.
+    NoMasterPosition,
+};
+
+/// Result of `getMasterPosition`. `file` is allocated from the caller's
+/// allocator; the caller owns it.
+pub const MasterPosition = struct {
+    file: []const u8,
+    position: u64,
 };
 
 /// Effective binlog start position after all checks run. Either the
@@ -215,6 +225,60 @@ fn validateBinlogPosition(
         .file = try allocator.dupe(u8, oldest_name),
         .position = 4,
         .adjusted = true,
+    };
+}
+
+/// Query the server's current binlog write head. Used as the bootstrap-of-
+/// last-resort by the connector's init flow (when neither a checkpoint nor
+/// `from_binlog_*` config is available), and again at init when
+/// `bound_to_master_at_init` sets the run's ceiling.
+///
+/// Tries `SHOW BINARY LOG STATUS` first (MySQL 8.4+); falls back to
+/// `SHOW MASTER STATUS` (5.7 / 8.0 / 8.4-deprecated, MariaDB) on any
+/// query error. If both fail, surfaces the second error so the operator
+/// sees the most likely diagnostic.
+pub fn getMasterPosition(
+    allocator: std.mem.Allocator,
+    conn: *connection.Connection,
+) !MasterPosition {
+    var rs = blk: {
+        if (conn.queryRows("SHOW BINARY LOG STATUS")) |rs| {
+            break :blk rs;
+        } else |err| {
+            log.debug("SHOW BINARY LOG STATUS not supported ({}); falling back to SHOW MASTER STATUS", .{err});
+            break :blk try conn.queryRows("SHOW MASTER STATUS");
+        }
+    };
+    defer rs.deinit();
+
+    if (rs.rows.len == 0) {
+        log.err("master-status query returned zero rows — binlog is likely disabled on this server", .{});
+        return Error.NoMasterPosition;
+    }
+
+    const row = rs.rows[0];
+    if (row.values.len < 2) {
+        log.err("master-status row has fewer than 2 columns ({d})", .{row.values.len});
+        return Error.NoMasterPosition;
+    }
+
+    const file = row.values[0] orelse {
+        log.err("master-status file column is NULL", .{});
+        return Error.NoMasterPosition;
+    };
+    const pos_str = row.values[1] orelse {
+        log.err("master-status position column is NULL", .{});
+        return Error.NoMasterPosition;
+    };
+
+    const position = std.fmt.parseInt(u64, pos_str, 10) catch |err| {
+        log.err("master-status position '{s}' is not numeric: {}", .{ pos_str, err });
+        return Error.NoMasterPosition;
+    };
+
+    return .{
+        .file = try allocator.dupe(u8, file),
+        .position = position,
     };
 }
 

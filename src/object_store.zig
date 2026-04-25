@@ -6,7 +6,7 @@
 //! the same small surface so parquet-writer and schema-cache can be
 //! migrated once and run unchanged against either backend.
 //!
-//! Surface (see `plans/01-myzql-binlog-connector.md`):
+//! Surface:
 //! - `create(key) -> WriteHandle` — streaming writer, commits on close
 //! - `read(key) -> []u8`          — full read; fine for cache/state
 //! - `head(key) -> HeadInfo`      — size + last-modified

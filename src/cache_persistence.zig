@@ -8,7 +8,6 @@
 //!
 //! Key layout under the store's root:
 //!   schema-cache/{16-hex-hash}.json.gz   — the cache payload
-//!   .schema_cache_latest                  — pointer to current cache key
 //!
 //! Identical schemas → identical keys → overwrite (not a new file); on S3
 //! that's ~90-99% fewer writes. Different schemas → new key; no separate
@@ -17,8 +16,10 @@
 //! downstream; on PosixStore a handful of stale files accumulates, which
 //! is fine.
 //!
-//! The `.schema_cache_latest` pointer goes away in Step 4 when the
-//! binlog checkpoint carries the cache key directly.
+//! The cache key for the current run is recorded in the binlog checkpoint
+//! (`{output_dir}/state/last_checkpoint.json`); see `src/state.zig`. There
+//! is no longer a free-standing latest-pointer file — load callers receive
+//! the key from the checkpoint and pass it to `loadCacheFromKey`.
 
 const std = @import("std");
 const object_store = @import("object_store.zig");
@@ -37,10 +38,9 @@ const log = std.log.scoped(.cache_persistence);
 const CACHE_VERSION: u32 = 2;
 
 const CACHE_PREFIX = "schema-cache/";
-const LATEST_POINTER_KEY = ".schema_cache_latest";
 
 /// Save the schema cache through the `ObjectStore`. Returns the key
-/// used (content-addressable).
+/// used (content-addressable). Caller owns the returned slice.
 ///
 /// Filename hash is computed over the stable body (version + schemas)
 /// only — `saved_at_unix` is wrapped on top for disk writes but excluded
@@ -48,9 +48,9 @@ const LATEST_POINTER_KEY = ".schema_cache_latest";
 /// runs, enabling overwrite-on-unchanged (dedup) semantics.
 ///
 /// Writes are atomic at the ObjectStore layer (sidecar + rename for
-/// PosixStore; single PUT / multipart for S3Store later). The
-/// `.schema_cache_latest` pointer is written after the cache file so a
-/// mid-save crash never leaves the pointer dangling at a missing key.
+/// PosixStore; single PUT / multipart for S3Store later). The returned
+/// key is recorded by the caller in the binlog checkpoint so the next
+/// run can find the cache without a free-standing pointer file.
 pub fn saveCache(
     allocator: std.mem.Allocator,
     cache: *SchemaCache,
@@ -98,25 +98,6 @@ pub fn saveCache(
         try h.commit();
     }
 
-    // Write the .schema_cache_latest pointer. Non-fatal if this fails
-    // because the cache file itself is durably on disk; next run will
-    // just cold-start without a resume.
-    {
-        var h = store.create(LATEST_POINTER_KEY) catch |err| {
-            log.warn("failed to write .schema_cache_latest: {}", .{err});
-            return cache_key;
-        };
-        errdefer h.abort();
-        h.write(cache_key) catch |err| {
-            log.warn("failed to write pointer content: {}", .{err});
-            return cache_key;
-        };
-        h.commit() catch |err| {
-            log.warn("failed to commit pointer: {}", .{err});
-            return cache_key;
-        };
-    }
-
     log.info(
         "schema cache saved: {s} ({d} bytes gzip / {d} bytes raw, {d} tables)",
         .{ cache_key, disk_payload.len, disk_json.len, cache.count() },
@@ -132,8 +113,9 @@ pub fn saveCache(
 // change; on S3 they're swept by lifecycle; on PosixStore a handful
 // accumulates and is fine.
 //
-// The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + .schema_cache_latest
-// protection` machinery has been removed wholesale.
+// The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + latest-pointer
+// protection` machinery was removed wholesale (Step 3); the latest-pointer
+// itself was retired in Step 4 — the binlog checkpoint carries the key.
 
 /// Load the schema cache by its ObjectStore key.
 pub fn loadCacheFromKey(
@@ -176,60 +158,6 @@ pub fn loadCacheFromKey(
 
     log.info("schema cache loaded: {s} ({d} tables)", .{ key, tables_loaded });
     return tables_loaded;
-}
-
-/// Load the most recent schema cache through the `ObjectStore`. Reads
-/// the `.schema_cache_latest` pointer to find the current cache key.
-/// `ttl_seconds` (opt-in): if non-null, the cache's storage-layer
-/// last-modified time is checked; anything older than `now - ttl` is
-/// treated as stale and skipped (caller proceeds as a cold run). Null
-/// disables the check.
-pub fn loadCache(
-    allocator: std.mem.Allocator,
-    cache: *SchemaCache,
-    store: *object_store.ObjectStore,
-    ttl_seconds: ?u64,
-    io: std.Io,
-) !usize {
-    // Resolve the current cache key from the pointer.
-    const raw_pointer = store.read(allocator, LATEST_POINTER_KEY) catch |err| switch (err) {
-        object_store.Error.NotFound => {
-            log.debug("no .schema_cache_latest pointer", .{});
-            return 0;
-        },
-        else => return 0,
-    };
-    defer allocator.free(raw_pointer);
-
-    const cache_key = std.mem.trim(u8, raw_pointer, "\n\r \t");
-    if (cache_key.len == 0) return 0;
-
-    // Staleness check — bootstrap-only. Uses storage-layer last-modified
-    // so an S3 backend can answer via HEAD alone, no GET.
-    if (ttl_seconds) |ttl| {
-        if (store.head(cache_key)) |info| {
-            const now_ts = std.Io.Clock.now(.real, io);
-            const now: i64 = @intCast(@divFloor(now_ts.nanoseconds, std.time.ns_per_s));
-            const mtime: i64 = @divFloor(info.last_modified_ms, std.time.ms_per_s);
-            if (isStaleByTtl(mtime, now, ttl)) {
-                log.warn(
-                    "schema cache '{s}' is stale (age {d}s, TTL {d}s); cold-starting",
-                    .{ cache_key, now - mtime, ttl },
-                );
-                return 0;
-            }
-        } else |err| switch (err) {
-            object_store.Error.NotFound => {
-                log.warn("pointer references missing key '{s}'; cold-starting", .{cache_key});
-                return 0;
-            },
-            else => {
-                log.debug("store.head failed ({}); TTL check skipped", .{err});
-            },
-        }
-    }
-
-    return try loadCacheFromKey(allocator, cache, store, cache_key);
 }
 
 /// Pure predicate — exposed for unit testing. `mtime` and `now` are Unix
@@ -717,8 +645,9 @@ test "looksLikeGzip accepts magic and rejects plain JSON" {
 }
 
 test "loader transparently decodes gzipped payload" {
-    // End-to-end: save via saveCache (which gzips), then load via
-    // loadCache (which detects gzip via magic bytes and decompresses).
+    // End-to-end: save via saveCache (which gzips), capture the returned
+    // content-addressable key, then load via loadCacheFromKey (which
+    // detects gzip via magic bytes and decompresses).
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -750,11 +679,10 @@ test "loader transparently decodes gzipped payload" {
     try std.testing.expect(std.mem.startsWith(u8, saved_key, "schema-cache/"));
     try std.testing.expect(std.mem.endsWith(u8, saved_key, ".json.gz"));
 
-    // Now load it back — loader must resolve the pointer, detect gzip
-    // via magic bytes, and decompress.
+    // Load via the returned key — gzip detection + decompress is internal.
     var cache_in = SchemaCache.init(allocator, null);
     defer cache_in.deinit();
-    const loaded = try loadCache(allocator, &cache_in, &store, null, io);
+    const loaded = try loadCacheFromKey(allocator, &cache_in, &store, saved_key);
     try std.testing.expectEqual(@as(usize, 1), loaded);
     try std.testing.expect(cache_in.get("testdb", "t1") != null);
 }

@@ -198,11 +198,16 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
   "password": "password",
   "database": "mydb",
   "from_binlog_file": "binlog.000001",
-  "from_binlog_position": 4,
-  "to_binlog_file": null,
-  "to_binlog_position": null
+  "from_binlog_position": 4
 }
 ```
+
+`from_binlog_*` is optional. If omitted, the connector resolves the start
+position at runtime via the chain **checkpoint > config > master query**
+(see [State Files & Resume](#state-files--resume)). `to_binlog_*` is also
+optional — when both are unset and `bound_to_master_at_init` is on
+(default), the run is auto-bounded to the master position captured at
+init.
 
 ### Parquet Mode
 
@@ -215,10 +220,8 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
   "database": "mydb",
   "from_binlog_file": "binlog.000002",
   "from_binlog_position": 4,
-  "to_binlog_file": "binlog.000002",
-  "to_binlog_position": 39309137,
   "output_mode": "parquet",
-  "parquet_output_dir": "./parquet_output",
+  "output_dir": "/var/lib/myzql-connector",
   "parquet_batch_size": 8192,
   "include": ["prod_db.*", "analytics_db.events"],
   "exclude": ["prod_db.debug_log", "*.tmp_data"],
@@ -227,22 +230,34 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
 }
 ```
 
+Parquet mode requires `output_dir`. The connector creates three
+subdirectories under it:
+
+```
+{output_dir}/state/        — current.json + last_checkpoint.json
+{output_dir}/ddl-cache/    — schema cache (gzipped JSON, content-addressable)
+{output_dir}/data/         — parquet output files
+```
+
 ### Configuration Reference
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `host` | string | yes | -- | MySQL server hostname or IP |
 | `port` | integer | yes | -- | MySQL server port |
-| `user` | string | no | -- | MySQL username (must have REPLICATION SLAVE) |
-| `password` | string | no | -- | MySQL password (use `""` for no password) |
+| `user` | string | no | `null` | MySQL username (must have REPLICATION SLAVE) |
+| `password` | string | no | `null` | MySQL password (use `""` for no password) |
 | `database` | string | no | `null` | Initial database for the connection |
-| `from_binlog_file` | string | yes | -- | Binlog file to start reading from |
-| `from_binlog_position` | integer | yes | -- | Byte offset to start at (4 = file start) |
-| `to_binlog_file` | string | no | `null` | Binlog file to stop at (`null` = read indefinitely) |
-| `to_binlog_position` | integer | no | `null` | Byte offset to stop at (`null` = end of file) |
+| `from_binlog_file` | string | no | `null` | Genesis start file. **Used only when no checkpoint exists.** Once `last_checkpoint.json` is written, this value is ignored on subsequent runs. |
+| `from_binlog_position` | integer | no | `null` | Genesis start position. Same caveat as `from_binlog_file`. Required if `from_binlog_file` is set; both must be set together or omitted. |
+| `to_binlog_file` | string | no | `null` | Stop at this file. `null` + `bound_to_master_at_init=true` → auto-bound to master at init. |
+| `to_binlog_position` | integer | no | `null` | Stop at this offset. Same auto-bound behavior. |
+| `bound_to_master_at_init` | boolean | no | `true` | When `to_binlog_*` is unset, query master at init and use as the run ceiling. Set to `false` for forever-streaming local CLI. No effect when `to_binlog_*` is set. |
 | `output_mode` | string | no | `"stdout"` | `"stdout"` or `"parquet"` |
-| `parquet_output_dir` | string | no | `"./parquet_output"` | Directory for Parquet files |
+| `output_dir` | string | no (yes for parquet) | `null` | Root for state files, schema cache, and parquet output. See [State Files & Resume](#state-files--resume). |
 | `parquet_batch_size` | integer | no | `8192` | Rows per Parquet batch / row group |
+| `current_state_staleness_ms` | integer | no | `90000` | Lock-staleness threshold for `current.json`. Older than this is presumed-crashed. |
+| `schema_cache_ttl_seconds` | integer | no | `null` | Optional staleness gate for the cached schemas. `null` disables the check (any non-empty cache is trusted). |
 | `include` | string[] | no | `null` | Table filter include patterns (see [Table Filtering](#table-filtering)) |
 | `exclude` | string[] | no | `null` | Table filter exclude patterns (see [Table Filtering](#table-filtering)) |
 | `log_level` | string | no | `"info"` | Log verbosity: `"debug"`, `"info"`, `"warn"`, `"err"` |
@@ -254,11 +269,86 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
 
 - `host` must not be empty
 - `port` must be greater than 0
-- `from_binlog_position` must be >= 4 (binlog header size)
+- `from_binlog_file` and `from_binlog_position` must be set together (or both omitted)
+- When set, `from_binlog_position` must be >= 4 (binlog header size)
+- `output_mode = "parquet"` requires `output_dir`
 - If `to_binlog_file` is specified and matches `from_binlog_file`, then `to_binlog_position` must be greater than `from_binlog_position`
 - Filter patterns must contain exactly one `.` and match one of: `schema.table`, `schema.*`, `*.table`
 - The same pattern cannot appear in both `include` and `exclude` (startup error)
 - `*.*` is not a valid pattern
+
+## State Files & Resume
+
+When `output_dir` is set, the connector persists two state files under
+`{output_dir}/state/`:
+
+- **`current.json`** — the lock. Written at startup when the connector
+  claims ownership; deleted on clean shutdown. A run finding a
+  recently-written `current.json` (younger than
+  `current_state_staleness_ms`, default 90s) exits gracefully without
+  doing any work, assuming a concurrent owner is active.
+- **`last_checkpoint.json`** — the durable resume point. Written once
+  on clean shutdown with the final binlog `{file, position}` and the
+  schema cache key. Subsequent runs read this and resume from the
+  recorded position.
+
+### Position resolution
+
+At startup, the connector resolves its start position via this chain
+(first hit wins):
+
+1. **`last_checkpoint.json`** if it exists. (`from_binlog_*` config is
+   ignored at this point.)
+2. **`from_binlog_*` config**, if both fields are set.
+3. **Master query** (`SHOW BINARY LOG STATUS`, falling back to
+   `SHOW MASTER STATUS`) — bootstrap-of-last-resort.
+
+If all three fail, the connector exits with a `[MISSING_START_POSITION]`
+error listing what was tried.
+
+### Footgun: config `from_binlog_*` is ignored once a checkpoint exists
+
+This is intentional — it's how resume works. The genesis `from_binlog_*`
+values in your config are used **once**, on the first run before any
+checkpoint exists. After that, the checkpoint is the source of truth.
+
+> **To force a fresh start from the config genesis:**
+>
+> ```sh
+> rm {output_dir}/state/last_checkpoint.json
+> # Optionally also: rm {output_dir}/state/current.json
+> ```
+>
+> Then re-run. The connector will see no checkpoint, fall through to
+> config (or master query), and start from there.
+
+This is *not* "compare config A vs checkpoint B and pick the newer one"
+— that would silently widen the data window in surprising ways. The
+checkpoint always wins; explicit deletion is the user-facing override.
+
+### Crash recovery
+
+On any error path during a run, the connector deliberately leaves
+`current.json` in place and does **not** write a checkpoint. The next
+run sees a stale lock (older than `current_state_staleness_ms`), logs a
+`found stale state, assuming crashed predecessor` warning, and resumes
+from the last successful `last_checkpoint.json`. Visible/loud failure
+is a feature — repeated stale-lock warnings on alerting dashboards are
+the operator's signal that runs aren't completing cleanly.
+
+### Auto-bounded runs (`bound_to_master_at_init`)
+
+By default, when `to_binlog_*` is not set in config, the connector
+queries master position at init and uses it as the run ceiling — i.e.
+"catch up to where master was when we started, then exit cleanly." This
+matches the Lambda invocation model and hedges against accidental
+concurrent runs (a stale-lock-misread-as-crashed scenario only ever
+re-replays the already-captured range, never an unbounded forward
+window).
+
+For local CLI users who want forever-streaming, set
+`"bound_to_master_at_init": false` and the connector will run until
+killed. Explicit `to_binlog_*` always wins.
 
 ## Table Filtering
 
