@@ -262,14 +262,15 @@ echo "==> Running connector run2 (cold parquet with output_dir)..."
 # 6a. Schema cache + state file assertions on run2.
 # ----------------------------------------------------------------
 echo "==> Asserting schema cache was written..."
-# Content-addressable layout: <output_dir>/ddl-cache/schema-cache/<16-hex-hash>.json.gz
-# (the inner schema-cache/ prefix is the cache module's namespace under
-# the ddl-cache/ subdir; the latest-pointer file was retired in Step 4 —
-# the binlog checkpoint carries the cache key now.)
+# Content-addressable layout: <output_dir>/ddl-cache/<16-hex-hash>.json.gz.
+# The latest-pointer file was retired in Step 4 (the binlog checkpoint
+# carries the cache key now), and the inner schema-cache/ prefix was
+# dropped as a Step 4 follow-up since output_dir/ddl-cache/ already
+# carries the namespace.
 shopt -s nullglob
-caches=("$OUTPUT_DIR"/ddl-cache/schema-cache/*.json.gz)
+caches=("$OUTPUT_DIR"/ddl-cache/*.json.gz)
 shopt -u nullglob
-[ ${#caches[@]} -gt 0 ] || fail "no ddl-cache/schema-cache/*.json.gz files in $OUTPUT_DIR"
+[ ${#caches[@]} -gt 0 ] || fail "no ddl-cache/*.json.gz files in $OUTPUT_DIR"
 [ ! -f "$OUTPUT_DIR/ddl-cache/.schema_cache_latest" ] || fail ".schema_cache_latest pointer should not exist after Step 4 (latest pointer retired)"
 
 # Verify the cache file really is gzipped (first two bytes = 1f 8b).
@@ -289,14 +290,15 @@ assert s['binlog_file'] == '$BINLOG_FILE', f\"checkpoint file: {s['binlog_file']
 assert int(s['binlog_position']) == $BINLOG_POS, f\"checkpoint pos: {s['binlog_position']} != $BINLOG_POS\"
 assert s['is_in_progress'] is False, 'is_in_progress should be false on clean shutdown'
 assert s['schema_cache_key'], 'checkpoint should reference a cache key'
-assert s['schema_cache_key'].startswith('schema-cache/'), f\"unexpected key: {s['schema_cache_key']}\"
+assert s['schema_cache_key'].endswith('.json.gz'), f\"unexpected key: {s['schema_cache_key']}\"
+assert '/' not in s['schema_cache_key'], f\"key should be flat (no inner prefix): {s['schema_cache_key']}\"
 print('  OK: checkpoint =', s['binlog_file'] + ':' + str(s['binlog_position']), 'cache_key =', s['schema_cache_key'])
 " || fail "checkpoint contents did not validate"
 
 echo "==> Asserting current.json was deleted on clean shutdown..."
 [ ! -f "$OUTPUT_DIR/state/current.json" ] || fail "current.json should not exist after clean shutdown"
 
-# Assert the parquet writer produced a non-empty file.
+# Assert the parquet writer produced non-empty files.
 shopt -s nullglob
 parquets=("$OUTPUT_DIR/data"/*.parquet)
 shopt -u nullglob
@@ -305,6 +307,25 @@ for pq in "${parquets[@]}"; do
   [ -s "$pq" ] || fail "empty parquet file: $pq"
 done
 echo "==> Parquet output: ${#parquets[@]} file(s)"
+
+# Step 6a — flush gates: with bounded run-1 spanning multiple binlog
+# files, the ROTATE gate alone produces one parquet per non-empty
+# binlog. Assert at least 2 files exist so a regression that drops
+# back to "single file per run" is caught.
+[ ${#parquets[@]} -ge 2 ] || fail "expected >=2 parquet files (Step 6a flush gates), got ${#parquets[@]}"
+
+# Filename contract: {from_file}.{from_pos}_{to_file}.{to_pos}_{uuid7}.parquet
+# Lightweight regex check on the first file — guards against accidental
+# regression to the pre-Step-6a `{binlog_file}.parquet` shape.
+first_pq_basename=$(basename "${parquets[0]}")
+echo "$first_pq_basename" | grep -qE '^mysql-bin\.[0-9]+\.[0-9]+_mysql-bin\.[0-9]+\.[0-9]+_[0-9a-f]+(-[0-9a-f]+)+\.parquet$' \
+  || fail "filename does not match Step 6a contract: $first_pq_basename"
+
+# No leftover .partial sidecars (orphans from a mid-write crash).
+shopt -s nullglob
+partials=("$OUTPUT_DIR/data"/.partial-*.parquet*)
+shopt -u nullglob
+[ ${#partials[@]} -eq 0 ] || fail "leftover .partial sidecars after clean shutdown: ${partials[*]}"
 
 # ----------------------------------------------------------------
 # 7. DuckDB-gated canary assertions. Optional: if duckdb isn't on

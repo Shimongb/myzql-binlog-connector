@@ -426,7 +426,34 @@ pub const ParquetWriter = struct {
         try buf.appendSlice(allocator, data);
     }
 
+    /// Optional rename target for `finishAs`. When supplied, the handle's
+    /// final key is overridden at commit time — used by Step 6a's flush
+    /// gates, where the parquet filename includes a `to_pos` component
+    /// that's only known once the last batch has been written.
+    pub const RenameTarget = struct {
+        store: *object_store.ObjectStore,
+        final_key: []const u8,
+    };
+
+    /// Finalize the parquet file and commit it under its original key.
+    /// Equivalent to `finishAs(null)`.
     pub fn finish(self: *ParquetWriter) !void {
+        return self.finishInner(null);
+    }
+
+    /// Finalize the parquet file and commit it under a different key
+    /// than the one used at `init`. The new key may live in a different
+    /// subdirectory; the ObjectStore lazy-creates the path. See
+    /// `RenameTarget` for the use case.
+    pub fn finishAs(
+        self: *ParquetWriter,
+        store: *object_store.ObjectStore,
+        final_key: []const u8,
+    ) !void {
+        return self.finishInner(.{ .store = store, .final_key = final_key });
+    }
+
+    fn finishInner(self: *ParquetWriter, rename_to: ?RenameTarget) !void {
         // If no row groups were written, discard any in-flight sidecar and
         // skip the footer — the output directory stays free of zero-row
         // parquets. Downstream readers using `dir/*.parquet` globs would
@@ -560,7 +587,11 @@ pub const ParquetWriter = struct {
         // On commit failure the abstraction already cleans up the sidecar;
         // we still null the handle so the caller's defer deinit() is safe.
         defer self.write_handle = null;
-        try handle.commit();
+        if (rename_to) |rt| {
+            try rt.store.commitHandleAs(handle, rt.final_key);
+        } else {
+            try handle.commit();
+        }
     }
 
     pub fn getBytesWritten(self: *const ParquetWriter) u64 {

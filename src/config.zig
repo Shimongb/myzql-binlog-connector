@@ -59,6 +59,31 @@ pub const DATA_SUBDIR = "data";
 /// `current_state_staleness_ms`.
 pub const DEFAULT_CURRENT_STATE_STALENESS_MS: i64 = 90_000;
 
+/// Default flush-size gate. Matches the Rust predecessor's production
+/// default. Above this many buffered binlog bytes (summed from event
+/// header `event_size`), the parquet writer flushes and starts a new
+/// file.
+pub const DEFAULT_FLUSH_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
+
+/// Lower bound for `flush_size_bytes` — prevents excessive flush
+/// thrashing on misconfigured deployments.
+pub const MIN_FLUSH_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
+
+/// Upper bound for `flush_size_bytes` — defence-in-depth against OOM.
+/// 1GB is generous enough for any reasonable Lambda memory tier and
+/// any local-CLI workflow. Tightening per-run via "25% of process
+/// memory budget" is a follow-up once we have a memory-budget config.
+pub const MAX_FLUSH_SIZE_BYTES: u64 = 1024 * 1024 * 1024; // 1GB
+
+/// Default time-gate: flush a non-empty buffer after this many ms of
+/// inactivity, even if the size gate hasn't triggered. Keeps low-
+/// traffic streams from sitting in memory indefinitely.
+pub const DEFAULT_FLUSH_TIME_GATE_MS: i64 = 10_000; // 10s
+
+/// Default soft deadline (Step 6b — wired in once Lambda lands).
+/// Declared now so configs are forward-compatible.
+pub const DEFAULT_SOFT_DEADLINE_MS: i64 = 90_000; // 90s
+
 /// Output mode for the connector
 pub const OutputMode = enum {
     stdout,
@@ -190,8 +215,20 @@ pub const Config = struct {
     // === State File Settings ===
     /// Lock-staleness threshold for `current.json`, in milliseconds.
     /// `current.json` older than this is presumed-crashed and the next
-    /// run resumes from `last_checkpoint.json`.
+    /// run resumes from `last_checkpoint.json`. See plans/01 Step 4.
     current_state_staleness_ms: i64 = DEFAULT_CURRENT_STATE_STALENESS_MS,
+
+    // === Parquet Flush Gate Settings (Step 6a) ===
+    /// Size gate. Buffered binlog bytes (sum of event_size) above this
+    /// trigger a flush. Bounds-clamped at config load — out-of-range
+    /// values are clamped with a WARN, not a hard fail.
+    flush_size_bytes: u64 = DEFAULT_FLUSH_SIZE_BYTES,
+    /// Time gate. Flushes a non-empty buffer after this many ms of
+    /// inactivity. Doesn't fire on an empty buffer.
+    flush_time_gate_ms: i64 = DEFAULT_FLUSH_TIME_GATE_MS,
+    /// Soft deadline (Step 6b — wired once Lambda invocation timeouts
+    /// matter). Declared now so configs are forward-compatible.
+    soft_deadline_ms: i64 = DEFAULT_SOFT_DEADLINE_MS,
 
     // === SSL/TLS Settings ===
     ssl: bool = true,
@@ -258,7 +295,30 @@ pub const Config = struct {
         // Validate the loaded configuration
         try parsed.value.validate();
 
-        return parsed.value;
+        // Bounds-clamping happens after validation so a misconfigured
+        // value gets a clear WARN instead of a hard fail. Mutates the
+        // value in place; the parser's arena owns the new defaults.
+        var clamped = parsed.value;
+        clamped.applyClamps();
+        return clamped;
+    }
+
+    /// Clamp out-of-range numeric settings to their bounds, logging a
+    /// WARN per field. Called from `loadFromFile` post-validation.
+    pub fn applyClamps(self: *Config) void {
+        if (self.flush_size_bytes < MIN_FLUSH_SIZE_BYTES) {
+            log.warn(
+                "flush_size_bytes={d} below min ({d}); clamping",
+                .{ self.flush_size_bytes, MIN_FLUSH_SIZE_BYTES },
+            );
+            self.flush_size_bytes = MIN_FLUSH_SIZE_BYTES;
+        } else if (self.flush_size_bytes > MAX_FLUSH_SIZE_BYTES) {
+            log.warn(
+                "flush_size_bytes={d} above max ({d}); clamping",
+                .{ self.flush_size_bytes, MAX_FLUSH_SIZE_BYTES },
+            );
+            self.flush_size_bytes = MAX_FLUSH_SIZE_BYTES;
+        }
     }
 
     /// Validate configuration values

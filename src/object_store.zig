@@ -6,7 +6,7 @@
 //! the same small surface so parquet-writer and schema-cache can be
 //! migrated once and run unchanged against either backend.
 //!
-//! Surface:
+//! Surface (see `plans/01-myzql-binlog-connector.md`):
 //! - `create(key) -> WriteHandle` — streaming writer, commits on close
 //! - `read(key) -> []u8`          — full read; fine for cache/state
 //! - `head(key) -> HeadInfo`      — size + last-modified
@@ -120,6 +120,20 @@ pub const ObjectStore = union(enum) {
     pub fn delete(self: *ObjectStore, key: []const u8) Error!void {
         return switch (self.*) {
             .posix => |*s| s.delete(key),
+        };
+    }
+
+    /// Commit a streaming write under a destination key that can only
+    /// be computed at close time (e.g. parquet filenames whose to_pos
+    /// component isn't known until the last batch is written). Overrides
+    /// the handle's final key, ensures the new parent directory exists,
+    /// then performs the atomic rename. The handle becomes unusable
+    /// after the call — same lifecycle as `commit`/`abort`.
+    pub fn commitHandleAs(self: *ObjectStore, handle: *WriteHandle, new_key: []const u8) Error!void {
+        return switch (handle.*) {
+            .posix => |*h| switch (self.*) {
+                .posix => |*s| h.commitAs(s.root_dir, new_key),
+            },
         };
     }
 };
@@ -315,6 +329,39 @@ pub const PosixWriteHandle = struct {
         defer self.allocator.free(temp_z);
         _ = posix.system.unlink(temp_z);
         self.cleanupPaths();
+    }
+
+    /// Variant of `commit` where the destination key is supplied at
+    /// close time rather than open time. Used when the final filename
+    /// depends on data not known when the handle was created (e.g.
+    /// parquet flush boundaries that include `to_pos`).
+    ///
+    /// Mutates `final_path` in place to point at `{store_root}/{new_key}`,
+    /// ensures the new parent directory exists, then performs the same
+    /// atomic rename as `commit`.
+    pub fn commitAs(
+        self: *PosixWriteHandle,
+        store_root: []const u8,
+        new_key: []const u8,
+    ) Error!void {
+        if (!isValidKey(new_key)) return Error.InvalidKey;
+
+        const new_final = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ store_root, new_key },
+        ) catch return Error.OutOfMemory;
+        // Free the old final_path now and replace it; commit() reads
+        // self.final_path so the swap must happen first.
+        self.allocator.free(self.final_path);
+        self.final_path = new_final;
+
+        // The new key may live under a different subdir than the original
+        // (e.g. `data/...` vs the original placeholder dir). Lazy-mkdir
+        // matches the behaviour of `create()`.
+        try ensureParentDir(self.allocator, self.final_path);
+
+        return self.commit();
     }
 
     fn cleanupPaths(self: *PosixWriteHandle) void {
@@ -589,4 +636,57 @@ test "ObjectStore: dispatches through tagged union" {
 
     try store.delete("via-union.txt");
     try std.testing.expectError(Error.NotFound, store.head("via-union.txt"));
+}
+
+test "ObjectStore: commitHandleAs renames to a different final key on commit" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root_owned = try allocator.dupe(u8, path_buf[0..root_len]);
+    defer allocator.free(root_owned);
+
+    var store: ObjectStore = .{ .posix = PosixStore.init(allocator, root_owned) };
+
+    // Open with a placeholder key, then commit to a different one — the
+    // exact pattern the parquet flush worker uses when to_pos is unknown
+    // at file-open time.
+    var h = try store.create("placeholder.partial");
+    try h.write("body");
+    try store.commitHandleAs(&h, "data/final.parquet");
+
+    // The committed-to key exists with the right content...
+    const got = try store.read(allocator, "data/final.parquet");
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("body", got);
+
+    // ...and the placeholder is NOT visible (the temp file was renamed,
+    // not duplicated).
+    try std.testing.expectError(Error.NotFound, store.head("placeholder.partial"));
+}
+
+test "ObjectStore: commitHandleAs rejects an invalid destination key" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root_owned = try allocator.dupe(u8, path_buf[0..root_len]);
+    defer allocator.free(root_owned);
+
+    var store: ObjectStore = .{ .posix = PosixStore.init(allocator, root_owned) };
+
+    var h = try store.create("good.partial");
+    try h.write("body");
+    // Path-traversal attempt rejected just like at create-time.
+    try std.testing.expectError(Error.InvalidKey, store.commitHandleAs(&h, "../bad.parquet"));
+    // Handle is unusable after a failed commit attempt; clean up the
+    // sidecar so we don't leak a temp file.
+    h.abort();
 }

@@ -1,4 +1,4 @@
-//! Binlog state files
+//! Binlog state files (Step 4 of plans/01-myzql-binlog-connector.md).
 //!
 //! Two-file pattern, agnostic of FS vs S3 via ObjectStore:
 //!   - current.json          — the lock; written at init, deleted at clean exit.
@@ -185,6 +185,45 @@ pub fn generateRunId(allocator: std.mem.Allocator) ![]u8 {
     // RFC 4122 variant: top 2 bits of byte 8 = 10
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
+    return formatUuidHyphenated(allocator, bytes);
+}
+
+/// Generate a UUIDv7 string. UUIDv7 (RFC 9562) embeds a 48-bit big-
+/// endian millisecond timestamp in the leading bytes, so two UUIDs
+/// generated milliseconds apart sort lexically — useful as a tail in
+/// time-bucketed filenames where lexical sort = chronological sort.
+///
+/// Layout (hyphens at the standard 8-4-4-4-12 positions):
+///   xxxxxxxx-xxxx-7xxx-yxxx-xxxxxxxxxxxx
+///   └── 48-bit ms timestamp ─┘ ↑    ↑
+///                             ver  variant
+///
+/// Caller passes `now_ms` so callers control the clock source (and
+/// tests can pass a fixed value).
+pub fn generateUuidV7(allocator: std.mem.Allocator, now_ms: i64) ![]u8 {
+    var bytes: [16]u8 = undefined;
+
+    // 48-bit big-endian timestamp at bytes 0..6.
+    const ts: u64 = @intCast(now_ms);
+    bytes[0] = @truncate(ts >> 40);
+    bytes[1] = @truncate(ts >> 32);
+    bytes[2] = @truncate(ts >> 24);
+    bytes[3] = @truncate(ts >> 16);
+    bytes[4] = @truncate(ts >> 8);
+    bytes[5] = @truncate(ts);
+
+    // Random for the remaining 10 bytes.
+    fillRandomBytes(bytes[6..]);
+
+    // RFC 9562 v7: top 4 bits of byte 6 = 0111
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    // RFC 4122 variant: top 2 bits of byte 8 = 10
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    return formatUuidHyphenated(allocator, bytes);
+}
+
+fn formatUuidHyphenated(allocator: std.mem.Allocator, bytes: [16]u8) ![]u8 {
     const hex_chars = "0123456789abcdef";
     const out = try allocator.alloc(u8, 36);
     var oi: usize = 0;
@@ -320,7 +359,7 @@ test "BinlogState round-trip via serializeState/parseState" {
         .binlog_position = 12345,
         .updated_at_ms = 1_700_000_000_000,
         .run_id = "abcdef01-2345-4678-9abc-def012345678",
-        .schema_cache_key = "schema-cache/feedface12345678.json.gz",
+        .schema_cache_key = "feedface12345678.json.gz",
         .is_in_progress = true,
     };
 
@@ -520,7 +559,7 @@ test "writeCheckpoint + loadCheckpoint round-trip" {
         .binlog_position = 9999,
         .updated_at_ms = 1_700_000_000_000,
         .run_id = "11111111-2222-4333-8444-555555555555",
-        .schema_cache_key = "schema-cache/cafebabe12345678.json.gz",
+        .schema_cache_key = "cafebabe12345678.json.gz",
         .is_in_progress = false,
     };
     try writeCheckpoint(allocator, &store, "checkpoint.json", expected);
@@ -589,5 +628,62 @@ test "generateRunId produces unique values" {
     defer allocator.free(a);
     const b = try generateRunId(allocator);
     defer allocator.free(b);
+    try testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "generateUuidV7 produces RFC 9562 v7 format" {
+    const allocator = testing.allocator;
+
+    const id = try generateUuidV7(allocator, 1_700_000_000_000);
+    defer allocator.free(id);
+
+    try testing.expectEqual(@as(usize, 36), id.len);
+    // 8-4-4-4-12 hyphen layout
+    try testing.expectEqual(@as(u8, '-'), id[8]);
+    try testing.expectEqual(@as(u8, '-'), id[13]);
+    try testing.expectEqual(@as(u8, '-'), id[18]);
+    try testing.expectEqual(@as(u8, '-'), id[23]);
+    // Version nibble: char index 14 must be '7'
+    try testing.expectEqual(@as(u8, '7'), id[14]);
+    // Variant nibble: char index 19 must be 8/9/a/b
+    try testing.expect(id[19] == '8' or id[19] == '9' or id[19] == 'a' or id[19] == 'b');
+}
+
+test "generateUuidV7 embeds the millisecond timestamp" {
+    const allocator = testing.allocator;
+
+    // Pick a known timestamp and verify the leading 48 bits round-trip.
+    // Hex layout: chars 0..8 + chars 9..13 = 12 hex chars = 48 bits.
+    const ts: i64 = 0x123456789abc;
+    const id = try generateUuidV7(allocator, ts);
+    defer allocator.free(id);
+
+    var hex_buf: [12]u8 = undefined;
+    @memcpy(hex_buf[0..8], id[0..8]);
+    @memcpy(hex_buf[8..12], id[9..13]);
+    const decoded = try std.fmt.parseInt(u64, &hex_buf, 16);
+    try testing.expectEqual(@as(u64, 0x123456789abc), decoded);
+}
+
+test "generateUuidV7 is time-sortable lexically" {
+    const allocator = testing.allocator;
+
+    const earlier = try generateUuidV7(allocator, 1_700_000_000_000);
+    defer allocator.free(earlier);
+    const later = try generateUuidV7(allocator, 1_700_000_001_000);
+    defer allocator.free(later);
+
+    // Lexical compare: earlier should sort before later.
+    try testing.expect(std.mem.order(u8, earlier, later) == .lt);
+}
+
+test "generateUuidV7 produces unique values at the same timestamp" {
+    const allocator = testing.allocator;
+    const a = try generateUuidV7(allocator, 1_700_000_000_000);
+    defer allocator.free(a);
+    const b = try generateUuidV7(allocator, 1_700_000_000_000);
+    defer allocator.free(b);
+    // Timestamps match → leading 48 bits are equal; uniqueness comes from
+    // the 74 random bits in the tail.
     try testing.expect(!std.mem.eql(u8, a, b));
 }

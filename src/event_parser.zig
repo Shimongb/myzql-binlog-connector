@@ -573,6 +573,7 @@ const DataReader = struct {
 };
 
 /// Parse old DATETIME format from binlog (8 bytes, not length-prefixed)
+/// Reference: Rust parse_datetime
 fn parseDateTimeOld(reader: *DataReader) DateTime {
     // Read as 8-byte little-endian integer
     var datetime_val = reader.readInt(u64);
@@ -605,6 +606,7 @@ fn parseDateTimeOld(reader: *DataReader) DateTime {
 }
 
 /// Parse old TIMESTAMP format from binlog (4 bytes, not length-prefixed)
+/// Reference: Rust parse_timestamp
 fn parseTimestampOld(reader: *DataReader) i64 {
     // Stored as a 4 byte UNIX timestamp (number of seconds since 00:00, Jan 1 1970 UTC).
     const seconds = reader.readInt(u32);
@@ -612,6 +614,7 @@ fn parseTimestampOld(reader: *DataReader) i64 {
 }
 
 /// Parse old TIME format from binlog (3 bytes, not length-prefixed)
+/// Reference: Rust parse_time
 fn parseTimeOld(reader: *DataReader) Duration {
     // Read 3-byte little-endian value
     const time_val_low = reader.readByte();
@@ -636,6 +639,7 @@ fn parseTimeOld(reader: *DataReader) Duration {
 }
 
 /// Parse DATE from binlog (3 bytes, not length-prefixed)
+/// Reference: Rust parse_date
 fn parseDate(reader: *DataReader) DateTime {
     // Read 3-byte little-endian value
     const date_low = reader.readByte();
@@ -702,6 +706,7 @@ fn parseFraction(reader: *DataReader, column_meta: u16) u32 {
 
 /// Parse DATETIME2 from binary binlog format
 /// Format: 5 bytes packed + optional fractional seconds
+/// Reference: Rust implementation parse_datetime2
 fn parseDateTime2(reader: *DataReader, column_meta: u16) DateTime {
     // Check if we have enough bytes
     if (reader.remaining() < 5) {
@@ -769,6 +774,7 @@ fn parseDateTime2(reader: *DataReader, column_meta: u16) DateTime {
 
 /// Parse TIMESTAMP2 from binary binlog format
 /// Format: 4 bytes (big-endian) seconds since epoch + optional fractional seconds
+/// Reference: Rust implementation parse_timestamp2
 /// Returns microseconds since epoch
 fn parseTimestamp2(reader: *DataReader, column_meta: u16) i64 {
     // Read 4-byte timestamp (big-endian) - seconds since epoch
@@ -859,6 +865,7 @@ fn parseStringColumnMeta(column_meta: u16, column_type: u8) struct { real_type: 
 }
 
 /// Parse a single column value based on column type (BINLOG FORMAT)
+/// Reference: Rust column_value.rs parse() function
 /// IMPORTANT: Binlog format is different from MySQL client protocol - no length encoding!
 fn parseColumnValue(allocator: std.mem.Allocator, reader: *DataReader, col_type: ColumnType, col_meta: u16) !RowValue {
     const ct: ColumnType = @enumFromInt(@intFromEnum(col_type));
