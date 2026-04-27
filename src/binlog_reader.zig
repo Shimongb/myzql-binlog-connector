@@ -237,7 +237,14 @@ pub const BinlogReader = struct {
                 const rotate = try event_parser.parseRotateEvent(self.allocator, event.data);
                 defer self.allocator.free(rotate.next_binlog_file);
 
-                log.info("binlog rotation: next_file={s}", .{rotate.next_binlog_file});
+                // Mirror fetchEvent's same-file suppression so stdout
+                // logs don't show two "rotation" lines per real boundary.
+                const same_file = std.mem.eql(u8, rotate.next_binlog_file, self.current_binlog_file);
+                if (same_file) {
+                    log.debug("binlog rotation: same target ({s}) — fake rotate suppressed", .{rotate.next_binlog_file});
+                } else {
+                    log.info("binlog rotation: next_file={s}", .{rotate.next_binlog_file});
+                }
 
                 self.allocator.free(self.current_binlog_file);
                 self.current_binlog_file = try self.allocator.dupe(u8, rotate.next_binlog_file);
@@ -426,9 +433,24 @@ pub const BinlogReader = struct {
             .ROTATE_EVENT => {
                 const rotate = try event_parser.parseRotateEvent(self.allocator, event.data);
 
+                // Detect the "fake" rotate the server sometimes emits at
+                // the start of a binlog stream (or right after a real
+                // rotate) — same target as our current file. Suppressing
+                // it prevents the pipeline from spuriously splitting a
+                // single binlog file's row events across multiple
+                // parquet files, which produces overlapping from/to
+                // ranges that downstream tools have to dedupe.
+                const same_file = std.mem.eql(u8, rotate.next_binlog_file, self.current_binlog_file);
+
                 self.allocator.free(self.current_binlog_file);
                 self.current_binlog_file = try self.allocator.dupe(u8, rotate.next_binlog_file);
                 self.current_position = rotate.next_position;
+
+                if (same_file) {
+                    log.debug("binlog rotation: same target ({s}) — suppressing duplicate rotate", .{rotate.next_binlog_file});
+                    self.allocator.free(rotate.next_binlog_file);
+                    return .skip;
+                }
 
                 log.info("binlog rotation: next_file={s}", .{rotate.next_binlog_file});
 

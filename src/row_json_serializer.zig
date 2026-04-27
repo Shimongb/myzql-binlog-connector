@@ -231,13 +231,14 @@ pub const RowJsonSerializer = struct {
 
                 if (micros == 0) {
                     try writer.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\"", .{
-                        year_day.year, month_day.month.numeric(), month_day.day_index + 1,
+                        year_day.year,                 month_day.month.numeric(),        month_day.day_index + 1,
                         day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute(),
                     });
                 } else {
                     try writer.print("\"{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z\"", .{
-                        year_day.year, month_day.month.numeric(), month_day.day_index + 1,
-                        day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute(), micros,
+                        year_day.year,                 month_day.month.numeric(),        month_day.day_index + 1,
+                        day_seconds.getHoursIntoDay(), day_seconds.getMinutesIntoHour(), day_seconds.getSecondsIntoMinute(),
+                        micros,
                     });
                 }
             },
@@ -245,12 +246,17 @@ pub const RowJsonSerializer = struct {
                 if (dur.microseconds == 0) {
                     try writer.print("\"{s}{d:0>2}:{d:0>2}:{d:0>2}\"", .{
                         if (dur.is_negative == 1) "-" else "",
-                        dur.hours, dur.minutes, dur.seconds,
+                        dur.hours,
+                        dur.minutes,
+                        dur.seconds,
                     });
                 } else {
                     try writer.print("\"{s}{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}\"", .{
                         if (dur.is_negative == 1) "-" else "",
-                        dur.hours, dur.minutes, dur.seconds, dur.microseconds,
+                        dur.hours,
+                        dur.minutes,
+                        dur.seconds,
+                        dur.microseconds,
                     });
                 }
             },
@@ -313,9 +319,9 @@ pub const RowJsonSerializer = struct {
                     } else {
                         // Determine expected UTF-8 sequence length from start byte
                         const seq_len: usize = if (c >= 0xF0 and c <= 0xF4) 4 //
-                        else if (c >= 0xE0) 3 //
-                        else if (c >= 0xC2) 2 //
-                        else 0; // 0x80-0xBF (continuation) or 0xC0-0xC1 (overlong)
+                            else if (c >= 0xE0) 3 //
+                            else if (c >= 0xC2) 2 //
+                            else 0; // 0x80-0xBF (continuation) or 0xC0-0xC1 (overlong)
 
                         if (seq_len >= 2 and i + seq_len <= str.len) {
                             // Validate continuation bytes (must be 0x80-0xBF)
@@ -469,7 +475,7 @@ test "bool coercion: wider types are NOT coerced" {
 
     const cols = [_]ColumnInfo{
         makeBoolCol("flags", "tinyint(4)"), // display width != 1 → not boolean
-        makeBoolCol("mask", "bit(8)"),      // bit(N>1) → not boolean
+        makeBoolCol("mask", "bit(8)"), // bit(N>1) → not boolean
     };
     const values = [_]event_parser.RowValue{
         .{ .tiny = 5 },

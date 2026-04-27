@@ -77,10 +77,10 @@ fn extractSign(allocator: std.mem.Allocator, data: []const u8) !SignInfo {
 
 /// Parsed digit groups from DECIMAL binary
 const DigitGroups = struct {
-    integral_leading: u32,      // Leading integral digits (< 9)
-    integral_groups: []u32,     // Full 9-digit integral groups
-    fractional_groups: []u32,   // Full 9-digit fractional groups
-    fractional_trailing: u32,   // Trailing fractional digits (< 9)
+    integral_leading: u32, // Leading integral digits (< 9)
+    integral_groups: []u32, // Full 9-digit integral groups
+    fractional_groups: []u32, // Full 9-digit fractional groups
+    fractional_trailing: u32, // Trailing fractional digits (< 9)
 
     integral_leading_digits: u8,
     fractional_trailing_digits: u8,
@@ -294,10 +294,10 @@ test "parseBigEndianInt" {
     try testing.expectEqual(@as(u32, 0x12), parseBigEndianInt(&[_]u8{0x12}));
 
     // 2 bytes
-    try testing.expectEqual(@as(u32, 0x1234), parseBigEndianInt(&[_]u8{0x12, 0x34}));
+    try testing.expectEqual(@as(u32, 0x1234), parseBigEndianInt(&[_]u8{ 0x12, 0x34 }));
 
     // 4 bytes
-    try testing.expectEqual(@as(u32, 0x12345678), parseBigEndianInt(&[_]u8{0x12, 0x34, 0x56, 0x78}));
+    try testing.expectEqual(@as(u32, 0x12345678), parseBigEndianInt(&[_]u8{ 0x12, 0x34, 0x56, 0x78 }));
 }
 
 test "decimalToString - positive simple" {

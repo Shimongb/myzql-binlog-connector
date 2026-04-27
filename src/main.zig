@@ -206,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
     log.debug("connection is alive", .{});
 
     // ====================================================================
-    // State init
+    // State init.
     //
     // Order:
     //   1. Resolve `state_dir` and `cache_dir` paths from config.output_dir.
@@ -317,10 +317,10 @@ pub fn main(init: std.process.Init) !void {
         effective_pos = mp.position;
     }
 
-    // Cold-start prerequisite checks: server config (hard fail on bad
-    // binlog_format/row_image), grants (soft warn), and binlog position
-    // validation (graceful adjust to oldest available if the requested
-    // file is missing).
+    // Cold-start prerequisite checks:
+    // server config (hard fail on bad binlog_format/row_image),
+    // grants (soft warn),
+    // and binlog position validation (graceful adjust to oldest available if the requested file is missing).
     log.info("running prerequisite checks", .{});
     const prereq = prereq_check.run(
         allocator,
@@ -341,8 +341,7 @@ pub fn main(init: std.process.Init) !void {
     // Auto-bound the run with master pos as the ceiling, when:
     //   * `bound_to_master_at_init` is true (default), AND
     //   * neither `to_binlog_file` nor `to_binlog_position` is set in config.
-    // Hedges against accidental concurrent runs (a stale-lock-misread-as-
-    // crashed scenario only re-replays the already-captured range), and
+    // Hedges against accidental concurrent runs (a stale-lock-misread-as-crashed scenario only re-replays the already-captured range)
     if (config.bound_to_master_at_init and config.to_binlog_file == null and config.to_binlog_position == null) {
         const ceiling = prereq_check.getMasterPosition(allocator, &conn) catch |err| blk: {
             log.warn("bound_to_master_at_init: master query failed ({}); leaving run unbounded", .{err});
@@ -468,22 +467,41 @@ pub fn main(init: std.process.Init) !void {
             // Validation guarantees output_dir is set when output_mode = parquet.
             const parquet_dir = data_dir_path.?;
 
-            var pipe = pipeline_mod.Pipeline.init(
-                gpa.allocator(),
-                parquet_dir,
-                prereq.file,
-                config.parquet_batch_size,
-                config.pipeline_queue_capacity,
-                config.boolean_encoding,
-            ) catch |err| {
+            // State store + run_id pointers for the pipeline's mid-run
+            // checkpoint hook. Both are guaranteed non-null in parquet
+            // mode (parquet → output_dir set → lock claimed → run_id).
+            const state_store_ptr: ?*object_store.ObjectStore =
+                if (state_store_opt) |*s| s else null;
+            const predecessor_cache_key: ?[]const u8 =
+                if (maybe_checkpoint) |cp| cp.schema_cache_key else null;
+
+            var pipe = pipeline_mod.Pipeline.init(.{
+                .allocator = gpa.allocator(),
+                .output_dir = parquet_dir,
+                .initial_binlog_file = prereq.file,
+                .batch_size = config.parquet_batch_size,
+                .event_queue_capacity = config.pipeline_queue_capacity,
+                .boolean_encoding = config.boolean_encoding,
+                .flush_size_bytes = config.flush_size_bytes,
+                .flush_time_gate_ms = config.flush_time_gate_ms,
+                .state_store = state_store_ptr,
+                .predecessor_cache_key = predecessor_cache_key,
+                .run_id = run_id.?,
+            }) catch |err| {
                 log.err("failed to initialize pipeline: {}", .{err});
                 return err;
             };
             defer pipe.deinit();
 
-            log.info("pipeline started: batch_size={d} queue_capacity={d}", .{
-                config.parquet_batch_size, config.pipeline_queue_capacity,
-            });
+            log.info(
+                "pipeline started: batch_size={d} queue_capacity={d} flush_size={d}MB time_gate={d}ms",
+                .{
+                    config.parquet_batch_size,
+                    config.pipeline_queue_capacity,
+                    @divTrunc(config.flush_size_bytes, 1024 * 1024),
+                    config.flush_time_gate_ms,
+                },
+            );
 
             // Event loop: fetch events and push to pipeline
             var running = true;

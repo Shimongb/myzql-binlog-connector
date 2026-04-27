@@ -1,5 +1,6 @@
 //! MySQL JSON Binary Format Decoder
 //!
+//! Production-ready implementation ported from mysql-binlog-connector-rust.
 //! Converts MySQL's binary JSON format to human-readable JSON strings for CDC applications.
 //!
 //! This decoder provides complete support for MySQL's binary JSON encoding including:

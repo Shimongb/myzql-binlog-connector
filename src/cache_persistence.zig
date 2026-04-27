@@ -7,7 +7,7 @@
 //! identical keys across runs).
 //!
 //! Key layout under the store's root:
-//!   schema-cache/{16-hex-hash}.json.gz   — the cache payload
+//!   {16-hex-hash}.json.gz   — the cache payload
 //!
 //! Identical schemas → identical keys → overwrite (not a new file); on S3
 //! that's ~90-99% fewer writes. Different schemas → new key; no separate
@@ -36,8 +36,6 @@ const log = std.log.scoped(.cache_persistence);
 /// On load, older versions are rejected by `deserializeCacheFromJson` and
 /// the connector cold-starts.
 const CACHE_VERSION: u32 = 2;
-
-const CACHE_PREFIX = "schema-cache/";
 
 /// Save the schema cache through the `ObjectStore`. Returns the key
 /// used (content-addressable). Caller owns the returned slice.
@@ -79,10 +77,11 @@ pub fn saveCache(
     const disk_payload = try gzipCompress(allocator, disk_json);
     defer allocator.free(disk_payload);
 
-    // Key under the store: schema-cache/{hash}.json.gz
+    // Key under the store: {hash}.json.gz (the store root is already
+    // the ddl-cache subdir of output_dir; no inner namespace needed).
     const cache_key = try std.fmt.allocPrint(
         allocator,
-        CACHE_PREFIX ++ "{s}.json.gz",
+        "{s}.json.gz",
         .{checksum_hex},
     );
     errdefer allocator.free(cache_key);
@@ -114,8 +113,8 @@ pub fn saveCache(
 // accumulates and is fine.
 //
 // The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + latest-pointer
-// protection` machinery was removed wholesale (Step 3); the latest-pointer
-// itself was retired in Step 4 — the binlog checkpoint carries the key.
+// protection` machinery was removed wholesale. the latest-pointer
+// itself was retired — the binlog checkpoint carries the key.
 
 /// Load the schema cache by its ObjectStore key.
 pub fn loadCacheFromKey(
@@ -675,9 +674,10 @@ test "loader transparently decodes gzipped payload" {
     const saved_key = try saveCache(allocator, &cache_out, &store, io);
     defer allocator.free(saved_key);
 
-    // Key contract: schema-cache/{hash}.json.gz
-    try std.testing.expect(std.mem.startsWith(u8, saved_key, "schema-cache/"));
+    // Key contract: {hash}.json.gz (no inner namespace prefix — the store
+    // root is already the ddl-cache subdir of output_dir).
     try std.testing.expect(std.mem.endsWith(u8, saved_key, ".json.gz"));
+    try std.testing.expect(std.mem.indexOfScalar(u8, saved_key, '/') == null);
 
     // Load via the returned key — gzip detection + decompress is internal.
     var cache_in = SchemaCache.init(allocator, null);
