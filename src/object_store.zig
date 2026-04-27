@@ -6,7 +6,7 @@
 //! the same small surface so parquet-writer and schema-cache can be
 //! migrated once and run unchanged against either backend.
 //!
-//! Surface (see `plans/01-myzql-binlog-connector.md`):
+//! Surface:
 //! - `create(key) -> WriteHandle` — streaming writer, commits on close
 //! - `read(key) -> []u8`          — full read; fine for cache/state
 //! - `head(key) -> HeadInfo`      — size + last-modified
@@ -15,7 +15,7 @@
 //! Not part of the interface:
 //! - Directory semantics, random-access seek, rename, file modes.
 //! - `list(prefix)` — schema-cache pruning used to motivate it, but
-//!   content-addressable naming (Step 3) retires that use case.
+//!   content-addressable naming retires that use case.
 //!
 //! Write atomicity: PosixStore writes to a `<key>.<pid>.<ns>.tmp` sidecar
 //! and `rename(2)`s on `commit()`. A partial write or a process crash

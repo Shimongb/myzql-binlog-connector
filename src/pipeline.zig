@@ -104,7 +104,7 @@ pub const PipelineMessage = union(enum) {
     row_event: RowEventData,
     rotate: RotateData,
     /// Periodic wake-up from the ticker thread; processing worker uses
-    /// it to evaluate the time gate (Step 6a).
+    /// it to evaluate the time gate.
     tick: void,
     shutdown: void,
 };
@@ -245,7 +245,7 @@ pub const Config = struct {
     event_queue_capacity: usize,
     boolean_encoding: BooleanEncoding,
 
-    // Step 6a flush gates — values come from config.zig.
+    // Flush gates — values come from config.zig.
     flush_size_bytes: u64,
     flush_time_gate_ms: i64,
 
@@ -257,8 +257,8 @@ pub const Config = struct {
     // shutdown via main.
     state_store: ?*object_store.ObjectStore,
     /// Pre-existing schema cache key carried into mid-run checkpoints
-    /// (the new key, if any, is only written by main at clean shutdown
-    /// — see plans/01 Step 6a). Borrowed; pipeline does not own.
+    /// the new key, if any, is only written by main at clean shutdown
+    /// Borrowed; pipeline does not own.
     predecessor_cache_key: ?[]const u8,
     /// Run identifier propagated into mid-run checkpoints. Borrowed.
     run_id: []const u8,
@@ -453,10 +453,9 @@ pub const Pipeline = struct {
 
                     // Size-gate accounting: sum the JSON byte length of
                     // both directions. JSON bytes are the right signal
-                    // for "memory we're holding before flush" (the
-                    // ColumnBatch arena dupes these strings) and track
-                    // parquet input size more directly than binlog wire
-                    // bytes would. See plans/01 Step 6a follow-up.
+                    // for "memory we're holding before flush"
+                    // (the ColumnBatch arena dupes these strings)
+                    // and track parquet input size more directly than binlog wire bytes would.
                     const row_size: u64 = (if (before_json) |b| b.len else 0) +
                         (if (after_json) |a| a.len else 0);
 

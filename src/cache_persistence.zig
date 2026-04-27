@@ -113,8 +113,8 @@ pub fn saveCache(
 // accumulates and is fine.
 //
 // The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + latest-pointer
-// protection` machinery was removed wholesale (Step 3); the latest-pointer
-// itself was retired in Step 4 — the binlog checkpoint carries the key.
+// protection` machinery was removed wholesale. the latest-pointer
+// itself was retired — the binlog checkpoint carries the key.
 
 /// Load the schema cache by its ObjectStore key.
 pub fn loadCacheFromKey(

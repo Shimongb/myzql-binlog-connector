@@ -59,7 +59,7 @@ pub const DATA_SUBDIR = "data";
 /// `current_state_staleness_ms`.
 pub const DEFAULT_CURRENT_STATE_STALENESS_MS: i64 = 90_000;
 
-/// Default flush-size gate. Matches the Rust predecessor's production
+/// Default flush-size gate.
 /// default. Above this many buffered binlog bytes (summed from event
 /// header `event_size`), the parquet writer flushes and starts a new
 /// file.
@@ -80,8 +80,7 @@ pub const MAX_FLUSH_SIZE_BYTES: u64 = 1024 * 1024 * 1024; // 1GB
 /// traffic streams from sitting in memory indefinitely.
 pub const DEFAULT_FLUSH_TIME_GATE_MS: i64 = 10_000; // 10s
 
-/// Default soft deadline (Step 6b — wired in once Lambda lands).
-/// Declared now so configs are forward-compatible.
+/// Default soft deadline
 pub const DEFAULT_SOFT_DEADLINE_MS: i64 = 90_000; // 90s
 
 /// Output mode for the connector
@@ -215,10 +214,10 @@ pub const Config = struct {
     // === State File Settings ===
     /// Lock-staleness threshold for `current.json`, in milliseconds.
     /// `current.json` older than this is presumed-crashed and the next
-    /// run resumes from `last_checkpoint.json`. See plans/01 Step 4.
+    /// run resumes from `last_checkpoint.json`.
     current_state_staleness_ms: i64 = DEFAULT_CURRENT_STATE_STALENESS_MS,
 
-    // === Parquet Flush Gate Settings (Step 6a) ===
+    // === Parquet Flush Gate Settings ===
     /// Size gate. Buffered binlog bytes (sum of event_size) above this
     /// trigger a flush. Bounds-clamped at config load — out-of-range
     /// values are clamped with a WARN, not a hard fail.
@@ -226,8 +225,7 @@ pub const Config = struct {
     /// Time gate. Flushes a non-empty buffer after this many ms of
     /// inactivity. Doesn't fire on an empty buffer.
     flush_time_gate_ms: i64 = DEFAULT_FLUSH_TIME_GATE_MS,
-    /// Soft deadline (Step 6b — wired once Lambda invocation timeouts
-    /// matter). Declared now so configs are forward-compatible.
+    /// Soft deadline
     soft_deadline_ms: i64 = DEFAULT_SOFT_DEADLINE_MS,
 
     // === SSL/TLS Settings ===

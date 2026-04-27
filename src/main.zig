@@ -206,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
     log.debug("connection is alive", .{});
 
     // ====================================================================
-    // State init — Step 4 (plans/01).
+    // State init.
     //
     // Order:
     //   1. Resolve `state_dir` and `cache_dir` paths from config.output_dir.
@@ -317,10 +317,10 @@ pub fn main(init: std.process.Init) !void {
         effective_pos = mp.position;
     }
 
-    // Cold-start prerequisite checks: server config (hard fail on bad
-    // binlog_format/row_image), grants (soft warn), and binlog position
-    // validation (graceful adjust to oldest available if the requested
-    // file is missing). See plans/01-myzql-binlog-connector.md step 7.
+    // Cold-start prerequisite checks:
+    // server config (hard fail on bad binlog_format/row_image),
+    // grants (soft warn),
+    // and binlog position validation (graceful adjust to oldest available if the requested file is missing).
     log.info("running prerequisite checks", .{});
     const prereq = prereq_check.run(
         allocator,
@@ -341,9 +341,7 @@ pub fn main(init: std.process.Init) !void {
     // Auto-bound the run with master pos as the ceiling, when:
     //   * `bound_to_master_at_init` is true (default), AND
     //   * neither `to_binlog_file` nor `to_binlog_position` is set in config.
-    // Hedges against accidental concurrent runs (a stale-lock-misread-as-
-    // crashed scenario only re-replays the already-captured range), and
-    // matches the Rust v1 / Lambda-shape "catch up then exit" model.
+    // Hedges against accidental concurrent runs (a stale-lock-misread-as-crashed scenario only re-replays the already-captured range)
     if (config.bound_to_master_at_init and config.to_binlog_file == null and config.to_binlog_position == null) {
         const ceiling = prereq_check.getMasterPosition(allocator, &conn) catch |err| blk: {
             log.warn("bound_to_master_at_init: master query failed ({}); leaving run unbounded", .{err});

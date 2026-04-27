@@ -24,9 +24,6 @@
 //! - Memory-efficient with stack-allocated decoder state
 //! - Proper escaping for JSON output (quotes, backslashes, control characters)
 //! - Tested with complex real-world Stripe authorization payloads
-//!
-//! Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/json__binary_8h.html
-//! Rust reference: mysql-binlog-connector-rust/src/column/json/json_binary.rs
 
 const std = @import("std");
 const ArrayListWriter = @import("array_writer.zig").ArrayListWriter;
@@ -227,31 +224,31 @@ fn decodeValue(
         .Literal => try decodeLiteral(allocator, decoder, output),
         .Int16 => {
             const val = try decoder.readI16();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Uint16 => {
             const val = try decoder.readU16();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Int32 => {
             const val = try decoder.readI32();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Uint32 => {
             const val = try decoder.readU32();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Int64 => {
             const val = try decoder.readI64();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Uint64 => {
             const val = try decoder.readU64();
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .Double => {
             const val = @as(f64, @bitCast(try decoder.readU64()));
-            try fmtAppend(allocator, output,"{d}", .{val});
+            try fmtAppend(allocator, output, "{d}", .{val});
         },
         .String => try decodeString(allocator, decoder, output),
         .Opaque => {
@@ -294,7 +291,7 @@ fn decodeString(
             '\r' => try output.appendSlice(allocator, "\\r"),
             '\t' => try output.appendSlice(allocator, "\\t"),
             0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                try fmtAppend(allocator, output,"\\u{x:0>4}", .{byte});
+                try fmtAppend(allocator, output, "\\u{x:0>4}", .{byte});
             },
             else => try output.append(allocator, byte),
         }
@@ -347,7 +344,6 @@ fn decodeOpaqueValue(
     const type_code = try decoder.readU8();
     const length = try decoder.readJsonVarint();
 
-    // Based on the Rust implementation pattern
     switch (type_code) {
         0, 246 => { // MYSQL_TYPE_DECIMAL, MYSQL_TYPE_NEWDECIMAL
             try decodeOpaqueDecimal(allocator, decoder, @intCast(length), output);
@@ -367,13 +363,13 @@ fn decodeOpaqueValue(
         else => {
             // Unknown or unsupported type - fall back to hex representation
             const opaque_data = try decoder.readBytes(@intCast(length));
-            try fmtAppend(allocator, output,"\"<type-{d}:", .{type_code});
+            try fmtAppend(allocator, output, "\"<type-{d}:", .{type_code});
             for (opaque_data) |byte| {
-                try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+                try fmtAppend(allocator, output, "{x:0>2}", .{byte});
             }
             try output.append(allocator, '>');
             try output.append(allocator, '"');
-        }
+        },
     }
 }
 
@@ -405,9 +401,9 @@ fn decodeOpaqueDecimal(
     ) catch |err| {
         // If decimal parsing fails, fall back to hex
         log.warn("decimal parsing failed: {}", .{err});
-        try fmtAppend(allocator, output,"\"<decimal-parse-error:p{d}s{d}:", .{precision, scale});
+        try fmtAppend(allocator, output, "\"<decimal-parse-error:p{d}s{d}:", .{ precision, scale });
         for (decimal_data) |byte| {
-            try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+            try fmtAppend(allocator, output, "{x:0>2}", .{byte});
         }
         try output.append(allocator, '>');
         try output.append(allocator, '"');
@@ -429,9 +425,9 @@ fn decodeOpaqueDateTime(
     if (length != 8) {
         // Unexpected length, fall back to hex
         const data = try decoder.readBytes(length);
-        try fmtAppend(allocator, output,"\"<dt-len-{d}:", .{length});
+        try fmtAppend(allocator, output, "\"<dt-len-{d}:", .{length});
         for (data) |byte| {
-            try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+            try fmtAppend(allocator, output, "{x:0>2}", .{byte});
         }
         try output.append(allocator, '>');
         try output.append(allocator, '"');
@@ -469,20 +465,18 @@ fn decodeOpaqueDateTime(
 
     // Validate ranges to catch parsing issues
     if (year > 9999 or month > 12 or month == 0 or day > 31 or day == 0 or
-        hour > 23 or min > 59 or sec > 59) {
+        hour > 23 or min > 59 or sec > 59)
+    {
         // Invalid datetime values, fall back to hex
-        try fmtAppend(allocator, output,"\"<invalid-dt:{d}-{d}-{d} {d}:{d}:{d}>\"",
-            .{year, month, day, hour, min, sec});
+        try fmtAppend(allocator, output, "\"<invalid-dt:{d}-{d}-{d} {d}:{d}:{d}>\"", .{ year, month, day, hour, min, sec });
         return;
     }
 
     // Format as ISO-like datetime string
     if (micro > 0) {
-        try fmtAppend(allocator, output,"\"{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}\"",
-            .{ year, month, day, hour, min, sec, micro });
+        try fmtAppend(allocator, output, "\"{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}\"", .{ year, month, day, hour, min, sec, micro });
     } else {
-        try fmtAppend(allocator, output,"\"{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\"",
-            .{ year, month, day, hour, min, sec });
+        try fmtAppend(allocator, output, "\"{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}\"", .{ year, month, day, hour, min, sec });
     }
 }
 
@@ -497,7 +491,7 @@ fn decodeOpaqueDate(
     const data = try decoder.readBytes(length);
     try output.append(allocator, '"');
     for (data) |byte| {
-        try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+        try fmtAppend(allocator, output, "{x:0>2}", .{byte});
     }
     try output.append(allocator, '"');
 }
@@ -513,7 +507,7 @@ fn decodeOpaqueTime(
     const data = try decoder.readBytes(length);
     try output.append(allocator, '"');
     for (data) |byte| {
-        try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+        try fmtAppend(allocator, output, "{x:0>2}", .{byte});
     }
     try output.append(allocator, '"');
 }
@@ -530,7 +524,7 @@ fn decodeOpaqueDouble(
         const data = try decoder.readBytes(length);
         try output.append(allocator, '"');
         for (data) |byte| {
-            try fmtAppend(allocator, output,"{x:0>2}", .{byte});
+            try fmtAppend(allocator, output, "{x:0>2}", .{byte});
         }
         try output.append(allocator, '"');
         return;
@@ -538,7 +532,7 @@ fn decodeOpaqueDouble(
 
     const double_bits = try decoder.readU64();
     const double_val = @as(f64, @bitCast(double_bits));
-    try fmtAppend(allocator, output,"{d}", .{double_val});
+    try fmtAppend(allocator, output, "{d}", .{double_val});
 }
 
 fn decodeObject(
@@ -683,7 +677,7 @@ fn decodeObject(
                         }
                     },
                     .numeric => |num| {
-                        try fmtAppend(allocator, output,"{d}", .{num});
+                        try fmtAppend(allocator, output, "{d}", .{num});
                     },
                 }
             } else {

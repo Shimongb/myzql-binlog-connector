@@ -427,7 +427,7 @@ pub const ParquetWriter = struct {
     }
 
     /// Optional rename target for `finishAs`. When supplied, the handle's
-    /// final key is overridden at commit time — used by Step 6a's flush
+    /// final key is overridden at commit time — used by flush
     /// gates, where the parquet filename includes a `to_pos` component
     /// that's only known once the last batch has been written.
     pub const RenameTarget = struct {
@@ -598,4 +598,3 @@ pub const ParquetWriter = struct {
         return self.bytes_written;
     }
 };
-

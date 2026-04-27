@@ -1,4 +1,4 @@
-//! Binlog state files (Step 4 of plans/01-myzql-binlog-connector.md).
+//! Binlog state files.
 //!
 //! Two-file pattern, agnostic of FS vs S3 via ObjectStore:
 //!   - current.json          — the lock; written at init, deleted at clean exit.
