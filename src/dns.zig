@@ -544,8 +544,12 @@ test "parseAResponse valid" {
         0x00, 0x00, // NSCOUNT=0
         0x00, 0x00, // ARCOUNT=0
         // Question: example.com A IN
-        0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
-        0x03, 'c', 'o', 'm',
+        0x07, 'e',
+        'x',  'a',
+        'm',  'p',
+        'l',  'e',
+        0x03, 'c',
+        'o',  'm',
         0x00, // null terminator
         0x00, 0x01, // QTYPE=A
         0x00, 0x01, // QCLASS=IN
