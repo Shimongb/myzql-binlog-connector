@@ -145,7 +145,14 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const cfg_path = config_path orelse {
+    // env-var override. `CONFIG_PATH` wins over the positional
+    // CLI arg when both are set; this is how the Lambda invocation path
+    // will pass the config (no CLI args available there).
+    // Local CLI users can also use it to override a hardcoded path (alias / wrapper script).
+    // Per-field env overrides are deliberately NOT supported here
+    // SSM-sourced config happens in the Lambda
+    const env_config_path = init.environ_map.get("CONFIG_PATH");
+    const cfg_path = env_config_path orelse config_path orelse {
         printUsage(prog_name);
         std.process.exit(1);
     };
@@ -156,6 +163,16 @@ pub fn main(init: std.process.Init) !void {
     log_config.init(if (cli_verbose) .debug else .info, cli_log_file);
 
     log.info("MySQL Binlog Connector v0.5.0", .{});
+
+    // Surface where the config path came from — helps ops debug when
+    // an env var unexpectedly shadows the CLI arg.
+    if (env_config_path != null and config_path != null) {
+        log.warn("CONFIG_PATH env var overrides CLI arg ('{s}' wins over '{s}')", .{ cfg_path, config_path.? });
+    } else if (env_config_path != null) {
+        log.info("config path from env CONFIG_PATH: {s}", .{cfg_path});
+    } else {
+        log.info("config path from CLI arg: {s}", .{cfg_path});
+    }
 
     // Load configuration
     log.info("loading configuration from: {s}", .{cfg_path});
