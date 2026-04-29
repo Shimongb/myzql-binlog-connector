@@ -501,6 +501,7 @@ pub fn main(init: std.process.Init) !void {
                 .boolean_encoding = config.boolean_encoding,
                 .flush_size_bytes = config.flush_size_bytes,
                 .flush_time_gate_ms = config.flush_time_gate_ms,
+                .soft_deadline_ms = config.soft_deadline_ms,
                 .state_store = state_store_ptr,
                 .predecessor_cache_key = predecessor_cache_key,
                 .run_id = run_id.?,
@@ -511,12 +512,13 @@ pub fn main(init: std.process.Init) !void {
             defer pipe.deinit();
 
             log.info(
-                "pipeline started: batch_size={d} queue_capacity={d} flush_size={d}MB time_gate={d}ms",
+                "pipeline started: batch_size={d} queue_capacity={d} flush_size={d}MB time_gate={d}ms soft_deadline={d}ms",
                 .{
                     config.parquet_batch_size,
                     config.pipeline_queue_capacity,
                     @divTrunc(config.flush_size_bytes, 1024 * 1024),
                     config.flush_time_gate_ms,
+                    config.soft_deadline_ms,
                 },
             );
 
@@ -524,6 +526,15 @@ pub fn main(init: std.process.Init) !void {
             var running = true;
             var events_sent: u64 = 0;
             while (running) {
+                // soft deadline: The ticker thread sets a flag when the budget elapses
+                // we poll between events so a long-running fetchEvent doesn't strand pending work.
+                // Once true, stop pumping; pipe.shutdown + pipe.join below drain the queue and write the final checkpoint.
+                if (pipe.shouldStop()) {
+                    log.info("graceful shutdown requested by soft deadline; stopping event pump", .{});
+                    running = false;
+                    break;
+                }
+
                 const fetched = reader.fetchEvent() catch |err| {
                     log.err("error fetching event: {}", .{err});
                     break;
