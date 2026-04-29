@@ -6,11 +6,8 @@
 #   * CREATE / ALTER ADD COLUMN / RENAME TABLE mid-run
 #   * Connector bounded by SHOW MASTER STATUS position
 #   * Named columns + ENUM label resolution in stdout output
-#   * Schema cache persistence (write on cold parquet run → load on
-#     resume run via checkpoint key, post-Step-4)
-#   * Resume from `last_checkpoint.json` after a clean shutdown — second
-#     run skips already-processed events and picks up exactly where the
-#     prior run stopped.
+#   * Schema cache persistence (write on cold parquet run → load on resume run via checkpoint key)
+#   * Resume from `last_checkpoint.json` after a clean shutdown — second run skips already-processed events and picks up exactly where the prior run stopped.
 #
 # Usage:
 #   ./docker/integration_test.sh            # run then tear down
@@ -318,8 +315,8 @@ echo "==> Parquet output: ${#parquets[@]} file(s)"
 # Lightweight regex check on the first file — guards against accidental
 # regression to the pre-Step-6a `{binlog_file}.parquet` shape.
 first_pq_basename=$(basename "${parquets[0]}")
-echo "$first_pq_basename" | grep -qE '^mysql-bin\.[0-9]+\.[0-9]+_mysql-bin\.[0-9]+\.[0-9]+_[0-9a-f]+(-[0-9a-f]+)+\.parquet$' \
-  || fail "filename does not match Step 6a contract: $first_pq_basename"
+echo "$first_pq_basename" | grep -qE '^mysql-bin\.[0-9]+\.[0-9]+_mysql-bin\.[0-9]+\.[0-9]+_[0-9a-f]+(-[0-9a-f]+)+\.parquet$' ||
+  fail "filename does not match Step 6a contract: $first_pq_basename"
 
 # No leftover .partial sidecars (orphans from a mid-write crash).
 shopt -s nullglob
