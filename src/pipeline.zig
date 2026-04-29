@@ -248,6 +248,13 @@ pub const Config = struct {
     // Flush gates — values come from config.zig.
     flush_size_bytes: u64,
     flush_time_gate_ms: i64,
+    /// soft deadline for graceful shutdown.
+    /// Pipeline records `start_ms` at init;
+    /// the ticker thread fires `deadline_fired` when `now - start_ms >= soft_deadline_ms`,
+    /// and main's event loop polls `shouldStop()` to wind down between events.
+    /// `0` (or negative) disables the gate entirely — typical for forever-streaming local
+    /// CLI; Lambda sets it from `lambda_ctx.deadline_ms - safety_margin`.
+    soft_deadline_ms: i64,
 
     // Mid-run checkpoint hook. When supplied, the flush worker writes
     // `last_checkpoint.json` after each successful flush so a crash
@@ -292,6 +299,12 @@ pub const Pipeline = struct {
     last_boundary_ms: i64,
     flush_size_bytes: u64,
     flush_time_gate_ms: i64,
+    /// `start_ms` is captured at init; `soft_deadline_ms` is the configured budget (≤0 disables);
+    /// `deadline_fired` is set by the ticker when budget elapses.
+    /// Atomic so the producer (main's event loop) can poll without locking.
+    start_ms: i64,
+    soft_deadline_ms: i64,
+    deadline_fired: std.atomic.Value(bool),
     state_store: ?*object_store.ObjectStore,
     predecessor_cache_key: ?[]const u8,
     run_id: []const u8,
@@ -322,6 +335,9 @@ pub const Pipeline = struct {
             .last_boundary_ms = nowMs(),
             .flush_size_bytes = opts.flush_size_bytes,
             .flush_time_gate_ms = opts.flush_time_gate_ms,
+            .start_ms = nowMs(),
+            .soft_deadline_ms = opts.soft_deadline_ms,
+            .deadline_fired = std.atomic.Value(bool).init(false),
             .state_store = opts.state_store,
             .predecessor_cache_key = opts.predecessor_cache_key,
             .run_id = opts.run_id,
@@ -352,6 +368,15 @@ pub const Pipeline = struct {
 
     pub fn send(self: *Pipeline, msg: PipelineMessage) bool {
         return self.event_queue.push(msg);
+    }
+
+    /// True once the soft deadline has elapsed.
+    /// Producers (main's event loop) poll this between events to wind down gracefully
+    /// at that point they should stop pumping new events and call `shutdown` + `join`.
+    /// The flush worker drains the rest of the queue and writes
+    /// the final checkpoint via the existing shutdown path.
+    pub fn shouldStop(self: *const Pipeline) bool {
+        return self.deadline_fired.load(.acquire);
     }
 
     pub fn shutdown(self: *Pipeline) void {
@@ -389,13 +414,9 @@ pub const Pipeline = struct {
         self.allocator.destroy(self);
     }
 
-    /// Wakes up every `flush_time_gate_ms / 4` ms and pushes a
-    /// `.tick` to the event queue. Lets the time gate fire on idle
-    /// streams (where no new events would otherwise wake the
-    /// processing worker). Quarter-period cadence is a coarse
-    /// trade-off: latency to fire the gate is at most 25% past the
-    /// configured threshold, while burning roughly 4 wakeups per gate
-    /// window — cheap enough.
+    /// Wakes up every `flush_time_gate_ms / 4` ms and pushes a `.tick` to the event queue.
+    /// Lets the time gate fire on idle streams (where no new events would otherwise wake the processing worker).
+    /// Quarter-period cadence is a coarse trade-off: latency to fire the gate is at most 25% past the configured threshold, while burning roughly 4 wakeups per gate window - cheap enough.
     fn tickerWorker(self: *Pipeline) void {
         const period_ns: u64 = blk: {
             const quarter_ms = @divTrunc(self.flush_time_gate_ms, 4);
@@ -406,9 +427,23 @@ pub const Pipeline = struct {
         while (!self.ticker_should_stop.load(.acquire)) {
             sleepNs(period_ns);
             if (self.ticker_should_stop.load(.acquire)) break;
+
+            // soft deadline.
+            // Fires once: subsequent ticks are no-ops because `deadline_fired` is sticky.
+            // Producers see the signal via `shouldStop()` and wind down at the next event boundary.
+            if (self.soft_deadline_ms > 0 and !self.deadline_fired.load(.acquire)) {
+                const elapsed = nowMs() - self.start_ms;
+                if (elapsed >= self.soft_deadline_ms) {
+                    log.info(
+                        "soft deadline reached after {d}ms (configured {d}ms); requesting graceful shutdown",
+                        .{ elapsed, self.soft_deadline_ms },
+                    );
+                    self.deadline_fired.store(true, .release);
+                }
+            }
+
             // The push is best-effort: if the event queue happens to
-            // be full, dropping a tick is fine — the next one will
-            // arrive in another period.
+            // be full, dropping a tick is fine — the next one will arrive in another period.
             _ = self.event_queue.push(.tick);
         }
     }
