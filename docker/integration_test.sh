@@ -6,17 +6,17 @@
 #   * CREATE / ALTER ADD COLUMN / RENAME TABLE mid-run
 #   * Connector bounded by SHOW MASTER STATUS position
 #   * Named columns + ENUM label resolution in stdout output
-#   * Schema cache persistence (write on cold parquet run → load on resume run via checkpoint key)
-#   * Resume from `last_checkpoint.json` after a clean shutdown — second run skips already-processed events and picks up exactly where the prior run stopped.
+#   * Schema cache persistence (write on cold parquet run → load on resume run via checkpoint key, post-Step-4)
+#   * Resume from `last_checkpoint.json` after a clean shutdown - second run skips already-processed events and picks up exactly where the prior run stopped.
 #
 # Usage:
 #   ./docker/integration_test.sh            # run then tear down
 #   ./docker/integration_test.sh --keep     # leave container + temp files for inspection
 #
 # Exit codes:
-#   0  — all assertions passed
-#   1  — assertion failure
-#   2  — setup failure (docker, mysql, build)
+#   0  - all assertions passed
+#   1  - assertion failure
+#   2  - setup failure (docker, mysql, build)
 
 set -euo pipefail
 
@@ -70,7 +70,7 @@ fail() {
 }
 
 # ----------------------------------------------------------------
-# 1. Bring up MySQL (idempotent — reuses any pre-existing container)
+# 1. Bring up MySQL (idempotent - reuses any pre-existing container)
 # ----------------------------------------------------------------
 if [ "$CONTAINER_WAS_RUNNING" = "true" ]; then
   echo "==> Reusing already-running myzql-ssl-test container"
@@ -98,7 +98,7 @@ MYSQL_EXEC=(docker exec -i myzql-ssl-test mysql
   testdb)
 
 # ----------------------------------------------------------------
-# 2. DDL + DML scenario — must include table that didn't exist in
+# 2. DDL + DML scenario - must include table that didn't exist in
 #    init.sql so we can verify CREATE was handled from binlog.
 # ----------------------------------------------------------------
 echo "==> Seeding DDL/DML scenario..."
@@ -124,7 +124,7 @@ INSERT INTO itest_renamed (id, label, note, kind) VALUES (4, 'fourth', 'after re
 
 -- ============================================================
 -- Canary events: a single table that exercises every type the
--- connector has had regressions on — bool coercion, enum/set
+-- connector has had regressions on - bool coercion, enum/set
 -- label resolution, decimal string precision, DATETIME(3)
 -- fractional seconds, JSON passthrough, BIT(1), BLOB with NULL,
 -- and tinyint(10) (prefix-match regression guard).
@@ -174,7 +174,7 @@ echo "==> Starting from $FIRST_BINLOG:4"
 
 # ----------------------------------------------------------------
 # 4. Build + run1 (cold stdout, no output_dir = no state files).
-#    Tests stdout column-name and ENUM-label rendering only — the
+#    Tests stdout column-name and ENUM-label rendering only - the
 #    state-file path is exercised in run2 + run3 below.
 # ----------------------------------------------------------------
 CONFIG="$TMPDIR/integration.config.json"
@@ -222,7 +222,7 @@ grep -qE 'kind:\s*"(alpha|beta|gamma)"' "$RUN1" || {
 }
 
 # ----------------------------------------------------------------
-# 6. run2 — cold parquet with output_dir set. Writes parquet output
+# 6. run2 - cold parquet with output_dir set. Writes parquet output
 #    AND state/cache so run3 below can resume.
 # ----------------------------------------------------------------
 OUTPUT_DIR="$TMPDIR/output"
@@ -278,7 +278,7 @@ echo "==> Asserting last_checkpoint.json was written..."
 CHECKPOINT="$OUTPUT_DIR/state/last_checkpoint.json"
 [ -f "$CHECKPOINT" ] || fail "checkpoint not written at $CHECKPOINT"
 
-# Sanity-check the checkpoint contents — final position should match
+# Sanity-check the checkpoint contents - final position should match
 # our bounded stop, and is_in_progress must be false.
 python3 -c "
 import json, sys
@@ -305,14 +305,14 @@ for pq in "${parquets[@]}"; do
 done
 echo "==> Parquet output: ${#parquets[@]} file(s)"
 
-# Step 6a — flush gates: with bounded run-1 spanning multiple binlog
+# Step 6a - flush gates: with bounded run-1 spanning multiple binlog
 # files, the ROTATE gate alone produces one parquet per non-empty
 # binlog. Assert at least 2 files exist so a regression that drops
 # back to "single file per run" is caught.
 [ ${#parquets[@]} -ge 2 ] || fail "expected >=2 parquet files (Step 6a flush gates), got ${#parquets[@]}"
 
 # Filename contract: {from_file}.{from_pos}_{to_file}.{to_pos}_{uuid7}.parquet
-# Lightweight regex check on the first file — guards against accidental
+# Lightweight regex check on the first file - guards against accidental
 # regression to the pre-Step-6a `{binlog_file}.parquet` shape.
 first_pq_basename=$(basename "${parquets[0]}")
 echo "$first_pq_basename" | grep -qE '^mysql-bin\.[0-9]+\.[0-9]+_mysql-bin\.[0-9]+\.[0-9]+_[0-9a-f]+(-[0-9a-f]+)+\.parquet$' ||
@@ -340,7 +340,7 @@ else
   # the null-blob / bitmask-full cases.
   #
   # `-list` + `-noheader` strip DuckDB's default box-drawing
-  # formatting — without them every row comes out as `│ OK row1_types │`,
+  # formatting - without them every row comes out as `│ OK row1_types │`,
   # breaking the `^OK `/`^FAIL ` greps below.
   DUCK_OUT="$TMPDIR/duck.out"
   duckdb -list -noheader -c "
@@ -421,14 +421,14 @@ else
   fi
 
   # If neither OK nor FAIL appeared, DuckDB probably matched zero rows
-  # (silent empty result) — dump the raw output so the user can see what
+  # (silent empty result) - dump the raw output so the user can see what
   # actually came back instead of failing opaquely on the pipefail.
   ok_count=$(grep -c '^OK ' "$DUCK_OUT" || true)
   if [ "$ok_count" -eq 0 ]; then
     echo "DuckDB canary output was empty or unrecognized:" >&2
     cat "$DUCK_OUT" >&2
     echo "  (expected lines starting with 'OK ' or 'FAIL '; got $(wc -l <"$DUCK_OUT") lines total)" >&2
-    fail "no canary assertions emitted — check parquet schema / WHERE clauses"
+    fail "no canary assertions emitted - check parquet schema / WHERE clauses"
   fi
 
   echo "==> Canary DuckDB assertions passed ($ok_count checks):"
@@ -436,7 +436,7 @@ else
 fi
 
 # ----------------------------------------------------------------
-# 8. run3 — resume from checkpoint. Insert one fresh event, capture
+# 8. run3 - resume from checkpoint. Insert one fresh event, capture
 #    the new master position, run the connector again with no
 #    `from_binlog_*` set: it should resume from run2's checkpoint,
 #    process the single new event, and update the checkpoint.
@@ -517,6 +517,111 @@ assert s['is_in_progress'] is False
 print('  OK: checkpoint advanced to', s['binlog_file'] + ':' + str(s['binlog_position']))
 " || fail "checkpoint did not advance to run3 stop position"
 
+# ----------------------------------------------------------------
+# 9. (Optional) S3 smoke - parquet + state + cache to a real bucket.
+#
+# Skipped by default. Enable by sourcing AWS credentials from your
+# external env file BEFORE invoking this script:
+#
+#     source ~/.myzql-binlog-aws.env
+#     ./docker/integration_test.sh
+#
+# The env file is intentionally outside the repo (no git accidents).
+# It must export AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, optionally
+# AWS_SESSION_TOKEN (for STS-vended sessions) + AWS_REGION.
+#
+# Bucket is hardcoded to `dev-myzql-binlog-connector`; smoke artifacts
+# land under `feat/s3-store/run-{timestamp}/` so concurrent test runs
+# don't stomp each other.
+# ----------------------------------------------------------------
+
+S3_SMOKE_RAN=false
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  echo "==> SKIP: AWS_ACCESS_KEY_ID not in env; S3 smoke skipped"
+  echo "    To enable: source ~/.myzql-binlog-aws.env && ./docker/integration_test.sh"
+elif ! command -v aws >/dev/null 2>&1; then
+  echo "==> SKIP: aws cli not in PATH; S3 smoke skipped"
+elif ! command -v duckdb >/dev/null 2>&1; then
+  echo "==> SKIP: duckdb not in PATH; S3 smoke skipped (install: brew install duckdb)"
+else
+  S3_BUCKET="dev-myzql-binlog-connector"
+  S3_BASE_PREFIX="feat/s3-store/run-$(date +%Y%m%d-%H%M%S)"
+  S3_URI="s3://${S3_BUCKET}/${S3_BASE_PREFIX}"
+  echo "==> Running S3 smoke at ${S3_URI}/ ..."
+
+  # Insert one fresh event so the smoke has something to flush.
+  "${MYSQL_EXEC[@]}" <<'SQL' >/dev/null
+INSERT INTO itest_renamed (id, label, note, kind) VALUES (6, 'sixth', 'for s3 smoke', 'gamma');
+SQL
+
+  if S3_NEW_POS=$("${MYSQL_EXEC[@]}" -N -B -e "SHOW BINARY LOG STATUS" 2>/dev/null); then
+    :
+  else
+    S3_NEW_POS=$("${MYSQL_EXEC[@]}" -N -B -e "SHOW MASTER STATUS")
+  fi
+  S3_BINLOG_FILE=$(echo "$S3_NEW_POS" | head -1 | awk '{print $1}')
+  S3_BINLOG_POS=$(echo "$S3_NEW_POS" | head -1 | awk '{print $2}')
+  [ -n "$S3_BINLOG_FILE" ] && [ -n "$S3_BINLOG_POS" ] || fail "could not capture master pos for S3 smoke"
+
+  S3_CONFIG="$TMPDIR/integration.s3.config.json"
+  cat >"$S3_CONFIG" <<EOF
+{
+  "host": "127.0.0.1",
+  "port": 23306,
+  "user": "myzql_repl_user",
+  "password": "ReplPass2025",
+  "database": "testdb",
+  "ssl": true,
+  "from_binlog_file": "$FIRST_BINLOG",
+  "from_binlog_position": 4,
+  "to_binlog_file": "$S3_BINLOG_FILE",
+  "to_binlog_position": $S3_BINLOG_POS,
+  "output_mode": "parquet",
+  "s3_uri": "$S3_URI",
+  "parquet_batch_size": 100,
+  "log_level": "info"
+}
+EOF
+
+  RUN_S3="$TMPDIR/run_s3.log"
+  echo "==> Running connector run_s3 (parquet → S3)..."
+  "$REPO_DIR/zig-out/bin/myzql_binlog_connector" "$S3_CONFIG" >"$RUN_S3" 2>&1 || {
+    echo "S3 smoke run exited non-zero; tail:" >&2
+    tail -40 "$RUN_S3" >&2
+    fail "S3 smoke run failed"
+  }
+
+  echo "==> Asserting state/last_checkpoint.json landed in S3..."
+  aws s3 ls "s3://${S3_BUCKET}/${S3_BASE_PREFIX}/state/last_checkpoint.json" >/dev/null ||
+    fail "no last_checkpoint.json at s3://${S3_BUCKET}/${S3_BASE_PREFIX}/state/"
+
+  echo "==> Asserting schema cache landed in S3..."
+  cache_count=$(aws s3 ls "s3://${S3_BUCKET}/${S3_BASE_PREFIX}/ddl-cache/" | grep -c '\.json\.gz$' || true)
+  [ "$cache_count" -gt 0 ] || fail "no schema cache at s3://${S3_BUCKET}/${S3_BASE_PREFIX}/ddl-cache/"
+
+  echo "==> Asserting parquet files landed in S3..."
+  parquet_count=$(aws s3 ls "s3://${S3_BUCKET}/${S3_BASE_PREFIX}/data/" | grep -c '\.parquet$' || true)
+  [ "$parquet_count" -gt 0 ] || fail "no parquet files at s3://${S3_BUCKET}/${S3_BASE_PREFIX}/data/"
+  echo "==> S3 parquet count: $parquet_count, cache files: $cache_count"
+
+  echo "==> Querying S3 parquet via DuckDB credential_chain..."
+  S3_DUCK_OUT="$TMPDIR/duck_s3.out"
+  duckdb -list -noheader -init "$REPO_DIR/docker/s3_bootstrap.sql" -c \
+    "SELECT CASE WHEN COUNT(*) > 0 THEN 'OK s3_parquet_rows=' || COUNT(*) ELSE 'FAIL s3_parquet_rows=0' END
+     FROM read_parquet('s3://${S3_BUCKET}/${S3_BASE_PREFIX}/data/*.parquet');" \
+    >"$S3_DUCK_OUT" 2>&1 || {
+    cat "$S3_DUCK_OUT" >&2
+    fail "duckdb query against S3 parquet failed"
+  }
+  if grep -q '^FAIL ' "$S3_DUCK_OUT"; then
+    cat "$S3_DUCK_OUT" >&2
+    fail "S3 parquet content unexpected"
+  fi
+  grep '^OK ' "$S3_DUCK_OUT" | sed 's/^/    /' || true
+
+  S3_SMOKE_RAN=true
+fi
+
 echo ""
 echo "==============================================="
 echo "  Integration test PASSED"
@@ -524,4 +629,8 @@ echo "  run1 (cold stdout) log:        $RUN1"
 echo "  run2 (cold parquet) log:       $RUN2"
 echo "  run3 (warm resume) log:        $RUN3"
 echo "  output_dir (state+cache+data): $OUTPUT_DIR"
+if [ "$S3_SMOKE_RAN" = "true" ]; then
+  echo "  s3 smoke artifacts (kept):     ${S3_URI}/"
+  echo "  s3 smoke run log:              $RUN_S3"
+fi
 echo "==============================================="

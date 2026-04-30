@@ -102,7 +102,7 @@ pub const Conn = struct {
         std.log.info("using auth plugin: {any}", .{auth_plugin});
         try conn.sendAuth(auth_plugin, &auth_data, config);
 
-        // Read auth response — may be OK, Error, or AuthSwitch.
+        // Read auth response - may be OK, Error, or AuthSwitch.
         // std.log.err("TRACE: about to readPacket for auth response", .{});
         const packet = try conn.readPacket();
         // std.log.err("TRACE: auth response received, first_byte=0x{x:0>2} len={d}", .{ packet.payload[0], packet.payload.len });
@@ -339,7 +339,7 @@ pub const Conn = struct {
         // Initialize the socket I/O bridge (raw fd -> Io.Reader/Writer vtables)
         socket_io.init(conn.stream.handle, tls_read_buf, tls_write_buf);
 
-        // Step 3: Allocate the TLS handles container at a stable address —
+        // Step 3: Allocate the TLS handles container at a stable address -
         // Reader and Writer use @fieldParentPtr on their .interface field, so
         // none of these values may be moved after init.
         const handles = try allocator.create(TlsHandles);

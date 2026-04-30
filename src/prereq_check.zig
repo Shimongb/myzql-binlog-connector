@@ -12,7 +12,7 @@
 //!   itself will fail loudly if grants are actually missing.
 //! - **Graceful adjust** if the requested binlog position is missing on the
 //!   server (expired by `PURGE BINARY LOGS`, failover reset, gap in chain).
-//!   Adjust to the *oldest* available binlog (not latest) — minimizes data
+//!   Adjust to the *oldest* available binlog (not latest) - minimizes data
 //!   loss, allows ops to backfill the gap later.
 
 const std = @import("std");
@@ -24,7 +24,7 @@ pub const Error = error{
     BinlogFormatNotRow,
     BinlogRowImageNotFull,
     NoBinlogsAvailable,
-    /// `SHOW MASTER STATUS` returned zero rows or unparseable data —
+    /// `SHOW MASTER STATUS` returned zero rows or unparseable data -
     /// usually means binlog is disabled on the server.
     NoMasterPosition,
 };
@@ -103,10 +103,10 @@ fn checkServerConfig(conn: *connection.Connection) !void {
     }
 
     if (!format_seen) {
-        log.warn("SHOW VARIABLES did not return binlog_format — cannot verify", .{});
+        log.warn("SHOW VARIABLES did not return binlog_format - cannot verify", .{});
     }
     if (!row_image_seen) {
-        log.warn("SHOW VARIABLES did not return binlog_row_image — cannot verify", .{});
+        log.warn("SHOW VARIABLES did not return binlog_row_image - cannot verify", .{});
     }
 }
 
@@ -135,7 +135,7 @@ fn checkReplicationGrants(conn: *connection.Connection) !void {
         log.info("replication grants: SLAVE + CLIENT detected [OK]", .{});
     } else {
         log.warn(
-            "replication grants not visible (SLAVE={}, CLIENT={}). May be a false negative — grant formats vary across MySQL/MariaDB versions. Binlog open will fail loudly if grants are actually missing.",
+            "replication grants not visible (SLAVE={}, CLIENT={}). May be a false negative - grant formats vary across MySQL/MariaDB versions. Binlog open will fail loudly if grants are actually missing.",
             .{ has_slave, has_client },
         );
     }
@@ -147,7 +147,7 @@ fn checkReplicationGrants(conn: *connection.Connection) !void {
 /// - If missing, return the oldest-available file at position 4, with a loud
 ///   WARN and `adjusted = true`. Position 4 is the standard start offset
 ///   (just past the magic header).
-/// - If the server has zero binlog files, return `NoBinlogsAvailable` —
+/// - If the server has zero binlog files, return `NoBinlogsAvailable` -
 ///   critical infrastructure issue, cannot proceed.
 fn validateBinlogPosition(
     allocator: std.mem.Allocator,
@@ -159,7 +159,7 @@ fn validateBinlogPosition(
     defer rs.deinit();
 
     if (rs.rows.len == 0) {
-        log.err("SHOW BINARY LOGS returned zero rows — server has no binlog files", .{});
+        log.err("SHOW BINARY LOGS returned zero rows - server has no binlog files", .{});
         return Error.NoBinlogsAvailable;
     }
 
@@ -191,7 +191,7 @@ fn validateBinlogPosition(
         };
     }
 
-    // File missing — classify the gap for operator diagnosis, then adjust.
+    // File missing - classify the gap for operator diagnosis, then adjust.
     const oldest_name = oldest orelse return Error.NoBinlogsAvailable;
 
     const gap_type: []const u8 = blk: {
@@ -207,7 +207,7 @@ fn validateBinlogPosition(
     };
 
     log.warn(
-        "requested binlog position {s}:{d} NOT FOUND — {s}. Oldest available: {s}, latest: {s}.",
+        "requested binlog position {s}:{d} NOT FOUND - {s}. Oldest available: {s}, latest: {s}.",
         .{
             requested_file,
             requested_position,
@@ -217,7 +217,7 @@ fn validateBinlogPosition(
         },
     );
     log.warn(
-        "adjusting to oldest available {s}:4 — minimizes data loss; operators can backfill the gap from upstream if needed.",
+        "adjusting to oldest available {s}:4 - minimizes data loss; operators can backfill the gap from upstream if needed.",
         .{oldest_name},
     );
 
@@ -252,7 +252,7 @@ pub fn getMasterPosition(
     defer rs.deinit();
 
     if (rs.rows.len == 0) {
-        log.err("master-status query returned zero rows — binlog is likely disabled on this server", .{});
+        log.err("master-status query returned zero rows - binlog is likely disabled on this server", .{});
         return Error.NoMasterPosition;
     }
 
@@ -294,7 +294,7 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 // ============================================================
-// Tests — pure helpers only. Query wrappers need a live MySQL
+// Tests - pure helpers only. Query wrappers need a live MySQL
 // connection and are exercised by the Docker integration test.
 // ============================================================
 

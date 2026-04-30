@@ -27,7 +27,7 @@ const state_mod = @import("state.zig");
 const log = std.log.scoped(.pipeline);
 
 /// Current Unix milliseconds. Local helper so pipeline doesn't need an
-/// `Io` plumbed through — the time gate's correctness only requires
+/// `Io` plumbed through - the time gate's correctness only requires
 /// monotonic-ish forward progress, not strict semantics. Reuses the
 /// project's `metrics.nanoTimestamp` helper (which routes to a
 /// libc-free clock_gettime on Linux, libc on macOS).
@@ -35,11 +35,11 @@ fn nowMs() i64 {
     return @intCast(@divFloor(metrics.nanoTimestamp(), std.time.ns_per_ms));
 }
 
-/// Sleep for `ns` nanoseconds via std.posix.system.nanosleep — routes
+/// Sleep for `ns` nanoseconds via std.posix.system.nanosleep - routes
 /// to the Linux syscall (no libc) and to macOS libc, matching the
 /// project's no-std.c policy. The signature differs slightly between
 /// platforms (`usize` return on Linux vs `c_int` on macOS), so we
-/// discard the result and don't retry on EINTR — for the ticker
+/// discard the result and don't retry on EINTR - for the ticker
 /// thread, an early return just produces an extra wake-up which
 /// `ticker_should_stop` handles cleanly.
 fn sleepNs(ns: u64) void {
@@ -110,7 +110,7 @@ pub const PipelineMessage = union(enum) {
 };
 
 /// Boundary marker passed to the flush worker. `kind` distinguishes
-/// soft flushes (size/time gate — same binlog file) from rotates
+/// soft flushes (size/time gate - same binlog file) from rotates
 /// (binlog file change). The uuid7 tail is owned by the flush worker
 /// per-file, generated at file open, so the boundary message itself
 /// carries no allocations beyond `next_binlog_file` (rotate only).
@@ -239,20 +239,28 @@ pub const ColumnBatch = struct {
 /// arg list grew long enough that positional confusion was a real risk.
 pub const Config = struct {
     allocator: std.mem.Allocator,
-    output_dir: []const u8,
+    /// Externally-owned storage backend for parquet writes. Lifetime
+    /// must span pipeline init..join. Either `PosixStore` (when config
+    /// `output_dir` is set) or `S3Store` (when `s3_uri` is set);
+    /// constructed by main.zig along with the state and cache stores.
+    data_store: *object_store.ObjectStore,
+    /// Human-readable label for log lines - typically the local path
+    /// or `s3://bucket/prefix/data`. Owned by caller; pipeline dupes
+    /// at init for self-contained log strings.
+    data_label: []const u8,
     initial_binlog_file: []const u8,
     batch_size: usize,
     event_queue_capacity: usize,
     boolean_encoding: BooleanEncoding,
 
-    // Flush gates — values come from config.zig.
+    // Flush gates - values come from config.zig.
     flush_size_bytes: u64,
     flush_time_gate_ms: i64,
     /// soft deadline for graceful shutdown.
     /// Pipeline records `start_ms` at init;
     /// the ticker thread fires `deadline_fired` when `now - start_ms >= soft_deadline_ms`,
     /// and main's event loop polls `shouldStop()` to wind down between events.
-    /// `0` (or negative) disables the gate entirely — typical for forever-streaming local
+    /// `0` (or negative) disables the gate entirely - typical for forever-streaming local
     /// CLI; Lambda sets it from `lambda_ctx.deadline_ms - safety_margin`.
     soft_deadline_ms: i64,
 
@@ -260,7 +268,7 @@ pub const Config = struct {
     // `last_checkpoint.json` after each successful flush so a crash
     // mid-run loses at most one flush window of progress. `null` means
     // no mid-run checkpoint (e.g. when output_dir state files aren't
-    // configured) — the run still writes a final checkpoint at clean
+    // configured) - the run still writes a final checkpoint at clean
     // shutdown via main.
     state_store: ?*object_store.ObjectStore,
     /// Pre-existing schema cache key carried into mid-run checkpoints
@@ -282,10 +290,12 @@ pub const Pipeline = struct {
     /// ticker can exit promptly when the pipeline is winding down.
     ticker_should_stop: std.atomic.Value(bool),
     batch_size: usize,
-    output_dir: []const u8,
-    /// Storage backend for parquet writes. Today a PosixStore rooted at
-    /// `output_dir`; Track 3 swaps in an S3Store when Lambda wiring lands.
-    store: object_store.ObjectStore,
+    /// Storage backend for parquet writes - borrowed from caller (main).
+    /// Either PosixStore or S3Store; pipeline doesn't care which. Caller
+    /// owns lifetime; pipeline only holds the pointer.
+    data_store: *object_store.ObjectStore,
+    /// Human-readable label for log lines. Owned (duped at init).
+    data_label: []u8,
     /// Initial binlog file at pipeline init. After init, the
     /// authoritative binlog-file tracker lives in the flush worker's
     /// local state (see `flushWorker`) so that boundary-time updates
@@ -294,7 +304,7 @@ pub const Pipeline = struct {
     /// Per-flush size-gate accumulator. JSON byte sum (before+after) of
     /// every event since the last boundary. Reset to 0 at boundary.
     bytes_since_boundary: u64,
-    /// Time gate state — ms timestamp of the last boundary emit, used
+    /// Time gate state - ms timestamp of the last boundary emit, used
     /// by the tick handler to decide whether the time gate fires.
     last_boundary_ms: i64,
     flush_size_bytes: u64,
@@ -326,10 +336,8 @@ pub const Pipeline = struct {
             .ticker_thread = null,
             .ticker_should_stop = std.atomic.Value(bool).init(false),
             .batch_size = opts.batch_size,
-            .output_dir = try allocator.dupe(u8, opts.output_dir),
-            // Store is initialized below after `output_dir` is duped so its
-            // `root_dir` slice has the Pipeline's lifetime.
-            .store = undefined,
+            .data_store = opts.data_store,
+            .data_label = try allocator.dupe(u8, opts.data_label),
             .initial_binlog_file = try allocator.dupe(u8, opts.initial_binlog_file),
             .bytes_since_boundary = 0,
             .last_boundary_ms = nowMs(),
@@ -345,18 +353,11 @@ pub const Pipeline = struct {
             .flush_metrics = .{},
             .boolean_encoding = opts.boolean_encoding,
         };
-        self.store = .{ .posix = object_store.PosixStore.init(allocator, self.output_dir) };
-
-        // Ensure output directory exists. PosixStore also lazy-creates
-        // parent dirs, but doing it eagerly here preserves the UX of
-        // "output_dir exists as soon as the pipeline is initialized,"
-        // useful when operators watch the directory.
-        const dir_z = allocator.dupeZ(u8, opts.output_dir) catch |err| {
-            log.warn("could not alloc dir path '{s}': {}", .{ opts.output_dir, err });
-            return err;
-        };
-        defer allocator.free(dir_z);
-        _ = std.posix.system.mkdir(dir_z.ptr, 0o755);
+        // The data store is borrowed from the caller (main); already
+        // probed-writable by the time the pipeline is constructed, so
+        // we don't repeat the probe here. PosixStore lazy-mkdirs parent
+        // dirs at first write - operator UX delta vs the old eager
+        // mkdir is "data dir appears 1-2s later instead of immediately".
 
         // Spawn workers + ticker
         self.flush_thread = try std.Thread.spawn(.{}, flushWorker, .{self});
@@ -409,14 +410,18 @@ pub const Pipeline = struct {
     pub fn deinit(self: *Pipeline) void {
         self.event_queue.deinit();
         self.flush_queue.deinit();
-        self.allocator.free(self.output_dir);
+        self.allocator.free(self.data_label);
         self.allocator.free(self.initial_binlog_file);
         self.allocator.destroy(self);
     }
 
-    /// Wakes up every `flush_time_gate_ms / 4` ms and pushes a `.tick` to the event queue.
-    /// Lets the time gate fire on idle streams (where no new events would otherwise wake the processing worker).
-    /// Quarter-period cadence is a coarse trade-off: latency to fire the gate is at most 25% past the configured threshold, while burning roughly 4 wakeups per gate window - cheap enough.
+    /// Wakes up every `flush_time_gate_ms / 4` ms and pushes a
+    /// `.tick` to the event queue. Lets the time gate fire on idle
+    /// streams (where no new events would otherwise wake the
+    /// processing worker). Quarter-period cadence is a coarse
+    /// trade-off: latency to fire the gate is at most 25% past the
+    /// configured threshold, while burning roughly 4 wakeups per gate
+    /// window - cheap enough.
     fn tickerWorker(self: *Pipeline) void {
         const period_ns: u64 = blk: {
             const quarter_ms = @divTrunc(self.flush_time_gate_ms, 4);
@@ -443,7 +448,8 @@ pub const Pipeline = struct {
             }
 
             // The push is best-effort: if the event queue happens to
-            // be full, dropping a tick is fine — the next one will arrive in another period.
+            // be full, dropping a tick is fine - the next one will
+            // arrive in another period.
             _ = self.event_queue.push(.tick);
         }
     }
@@ -665,7 +671,7 @@ pub const Pipeline = struct {
         // The authoritative binlog-file pointer for the parquet writer
         // lives here, in the flush worker's local frame. Updated only
         // when this worker processes a `.rotate` boundary. The
-        // processing worker doesn't touch it — see emitBoundary's
+        // processing worker doesn't touch it - see emitBoundary's
         // commentary for the race that motivated this split.
         var current_binlog_file: []u8 = self.allocator.dupe(u8, self.initial_binlog_file) catch {
             log.err("flush_worker: failed to alloc binlog file tracker", .{});
@@ -750,7 +756,7 @@ pub const Pipeline = struct {
                     // mid-run checkpoint after a successful commit.
                     self.closeFile(&fs);
                     // On rotate, swap our local binlog-file tracker
-                    // BEFORE the next batch arrives — that's the from_file
+                    // BEFORE the next batch arrives - that's the from_file
                     // the next openFile will record.
                     if (boundary.kind == .rotate) {
                         if (boundary.next_binlog_file) |nf| {
@@ -777,9 +783,9 @@ pub const Pipeline = struct {
 
     /// Lazy file open. `current_binlog_file` is the flush worker's
     /// local pointer (passed in to avoid a race with the processing
-    /// worker — see `flushWorker`). Mints a fresh UUIDv7 for the
+    /// worker - see `flushWorker`). Mints a fresh UUIDv7 for the
     /// file's tail. The underlying ObjectStore handle opens with a
-    /// placeholder key — the final filename (with from/to positions)
+    /// placeholder key - the final filename (with from/to positions)
     /// is computed at close time and passed to `finishAs`.
     fn openFile(self: *Pipeline, fs: *FileState, current_binlog_file: []const u8) !void {
         std.debug.assert(fs.pw == null);
@@ -803,8 +809,8 @@ pub const Pipeline = struct {
         const from_file = try self.allocator.dupe(u8, current_binlog_file);
         errdefer self.allocator.free(from_file);
 
-        log.info("opening parquet file (placeholder): {s}/{s}", .{ self.output_dir, placeholder });
-        fs.pw = try ParquetWriter.init(self.allocator, &self.store, placeholder);
+        log.info("opening parquet file (placeholder): {s}/{s}", .{ self.data_label, placeholder });
+        fs.pw = try ParquetWriter.init(self.allocator, self.data_store, placeholder);
         fs.uuid7 = uuid;
         fs.from_file = from_file;
         fs.from_pos = null;
@@ -834,7 +840,7 @@ pub const Pipeline = struct {
         }
 
         // Build final key: {from_file}.{from_pos}_{to_file}.{to_pos}_{uuid7}.parquet
-        // (no `data/` prefix — store root is already the data subdir).
+        // (no `data/` prefix - store root is already the data subdir).
         const final_key = std.fmt.allocPrint(
             self.allocator,
             "{s}.{d}_{s}.{d}_{s}.parquet",
@@ -860,7 +866,7 @@ pub const Pipeline = struct {
         defer self.allocator.free(final_key);
 
         var w = fs.pw.?;
-        w.finishAs(&self.store, final_key) catch |err| {
+        w.finishAs(self.data_store, final_key) catch |err| {
             log.err("flush_worker: failed to commit parquet '{s}': {}", .{ final_key, err });
             self.flush_metrics.bytes_written += w.getBytesWritten();
             w.deinit();
@@ -871,7 +877,7 @@ pub const Pipeline = struct {
         w.deinit();
         log.info("flushed parquet: {s}", .{final_key});
 
-        // Mid-run checkpoint write — the durable resume point now
+        // Mid-run checkpoint write - the durable resume point now
         // includes the position of the last event we committed to disk.
         // Failures here are non-fatal: a missing checkpoint just means
         // the next run resumes from an older one.

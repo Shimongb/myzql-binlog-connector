@@ -51,7 +51,7 @@ pub fn handleDdl(
     // Skip transaction control statements
     if (isTransactionControl(sql)) return;
 
-    // Use a temporary arena for SQL parsing — the AST is only needed
+    // Use a temporary arena for SQL parsing - the AST is only needed
     // during this function; column info is duped to the cache allocator.
     var parse_arena = std.heap.ArenaAllocator.init(allocator);
     defer parse_arena.deinit();
@@ -468,7 +468,7 @@ fn isTransactionControl(sql: []const u8) bool {
 /// Convert a myzqlparser DataType to a DESCRIBE-style type string.
 fn datatypeToString(allocator: std.mem.Allocator, data_type: myzqlparser.DataType) ![]const u8 {
     return switch (data_type) {
-        // tinyint / bit MUST carry their display width when set — that's
+        // tinyint / bit MUST carry their display width when set - that's
         // how `tinyint(1)` / `bit(1)` signal BOOL intent for downstream
         // coercion in row_json_serializer (`columnTypeIsBool1`). Dropping
         // the width here meant bool columns silently shipped as integers

@@ -7,18 +7,18 @@
 //! identical keys across runs).
 //!
 //! Key layout under the store's root:
-//!   {16-hex-hash}.json.gz   — the cache payload
+//!   {16-hex-hash}.json.gz   - the cache payload
 //!
 //! Identical schemas → identical keys → overwrite (not a new file); on S3
 //! that's ~90-99% fewer writes. Different schemas → new key; no separate
 //! index file is maintained because the content *is* the index. Stale
-//! keys orphan naturally on schema change — S3 lifecycle sweeps them
+//! keys orphan naturally on schema change - S3 lifecycle sweeps them
 //! downstream; on PosixStore a handful of stale files accumulates, which
 //! is fine.
 //!
 //! The cache key for the current run is recorded in the binlog checkpoint
 //! (`{output_dir}/state/last_checkpoint.json`); see `src/state.zig`. There
-//! is no longer a free-standing latest-pointer file — load callers receive
+//! is no longer a free-standing latest-pointer file - load callers receive
 //! the key from the checkpoint and pass it to `loadCacheFromKey`.
 
 const std = @import("std");
@@ -41,7 +41,7 @@ const CACHE_VERSION: u32 = 2;
 /// used (content-addressable). Caller owns the returned slice.
 ///
 /// Filename hash is computed over the stable body (version + schemas)
-/// only — `saved_at_unix` is wrapped on top for disk writes but excluded
+/// only - `saved_at_unix` is wrapped on top for disk writes but excluded
 /// from the hash so identical schemas produce identical keys across
 /// runs, enabling overwrite-on-unchanged (dedup) semantics.
 ///
@@ -106,15 +106,15 @@ pub fn saveCache(
 }
 
 // Pruning is intentionally removed. Content-addressable naming means
-// stable schemas produce stable keys — `create(key)` overwrites on a
-// repeat save instead of generating a new file — so no dir-wide sweep
+// stable schemas produce stable keys - `create(key)` overwrites on a
+// repeat save instead of generating a new file - so no dir-wide sweep
 // is needed. Stale keys from past schema revisions orphan naturally on
 // change; on S3 they're swept by lifecycle; on PosixStore a handful
 // accumulates and is fine.
 //
 // The old `pruneOldCacheFiles + DEFAULT_KEEP_N + list + latest-pointer
 // protection` machinery was removed wholesale. the latest-pointer
-// itself was retired — the binlog checkpoint carries the key.
+// itself was retired - the binlog checkpoint carries the key.
 
 /// Load the schema cache by its ObjectStore key.
 pub fn loadCacheFromKey(
@@ -159,7 +159,7 @@ pub fn loadCacheFromKey(
     return tables_loaded;
 }
 
-/// Pure predicate — exposed for unit testing. `mtime` and `now` are Unix
+/// Pure predicate - exposed for unit testing. `mtime` and `now` are Unix
 /// seconds; returns true if the cache should be treated as stale.
 pub fn isStaleByTtl(mtime: i64, now: i64, ttl_seconds: u64) bool {
     if (now <= mtime) return false; // clock skew: trust the cache
@@ -197,7 +197,7 @@ fn serializeCacheToJson(allocator: std.mem.Allocator, cache: *SchemaCache) ![]co
         }
     }.lt);
 
-    // Stable body — version + schemas only. `saved_at_unix` is wrapped on
+    // Stable body - version + schemas only. `saved_at_unix` is wrapped on
     // top at write time by `wrapWithSavedAt`, so the content-addressable
     // checksum doesn't churn every save when schemas are unchanged.
     try buf.appendSlice(allocator, "{\"version\":");
@@ -616,7 +616,7 @@ test "checksum is stable across saves when schemas don't change" {
     try std.testing.expectEqualSlices(u8, &computeChecksum(stable_a), &computeChecksum(stable_b));
 }
 
-// (Prune tests removed: content-addressable naming makes them moot —
+// (Prune tests removed: content-addressable naming makes them moot -
 // identical schemas overwrite in place, different schemas orphan old
 // keys; ObjectStore has no list() and we no longer sweep the dir.)
 
@@ -659,7 +659,7 @@ test "loader transparently decodes gzipped payload" {
 
     var store: object_store.ObjectStore = .{ .posix = object_store.PosixStore.init(allocator, dir_path) };
 
-    // Build a minimal but valid cache and save it — this exercises the
+    // Build a minimal but valid cache and save it - this exercises the
     // gzip-write path end-to-end.
     var cache_out = SchemaCache.init(allocator, null);
     defer cache_out.deinit();
@@ -674,12 +674,12 @@ test "loader transparently decodes gzipped payload" {
     const saved_key = try saveCache(allocator, &cache_out, &store, io);
     defer allocator.free(saved_key);
 
-    // Key contract: {hash}.json.gz (no inner namespace prefix — the store
+    // Key contract: {hash}.json.gz (no inner namespace prefix - the store
     // root is already the ddl-cache subdir of output_dir).
     try std.testing.expect(std.mem.endsWith(u8, saved_key, ".json.gz"));
     try std.testing.expect(std.mem.indexOfScalar(u8, saved_key, '/') == null);
 
-    // Load via the returned key — gzip detection + decompress is internal.
+    // Load via the returned key - gzip detection + decompress is internal.
     var cache_in = SchemaCache.init(allocator, null);
     defer cache_in.deinit();
     const loaded = try loadCacheFromKey(allocator, &cache_in, &store, saved_key);

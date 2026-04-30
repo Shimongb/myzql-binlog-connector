@@ -49,7 +49,7 @@ pub const TableFilter = struct {
 
     /// Initialize the filter from raw include/exclude pattern arrays.
     /// Validates all patterns and checks for conflicts.
-    /// The pattern strings are NOT owned by the filter — they must outlive it
+    /// The pattern strings are NOT owned by the filter - they must outlive it
     /// (typically owned by the config arena allocator).
     pub fn init(
         allocator: std.mem.Allocator,
@@ -108,10 +108,10 @@ pub const TableFilter = struct {
     /// Evaluate whether a table should be included in processing.
     /// Uses specificity-based evaluation: more specific rules override less specific ones.
     pub fn shouldInclude(self: *const TableFilter, schema: []const u8, table: []const u8) bool {
-        // Level 1: exact match (schema.table) — most specific
+        // Level 1: exact match (schema.table) - most specific
         var buf: [512]u8 = undefined;
         const fqn = std.fmt.bufPrint(&buf, "{s}.{s}", .{ schema, table }) catch {
-            // Schema + table name exceeds 512 chars — include by default
+            // Schema + table name exceeds 512 chars - include by default
             log.warn("schema.table name exceeds buffer: {s}.{s}", .{ schema, table });
             return true;
         };
@@ -294,7 +294,7 @@ fn checkConflicts(self: *const TableFilter) FilterError!void {
 // Tests
 // =============================================================================
 
-test "no filters — include everything" {
+test "no filters - include everything" {
     var filter = try TableFilter.init(std.testing.allocator, null, null);
     defer filter.deinit();
 
@@ -302,7 +302,7 @@ test "no filters — include everything" {
     try std.testing.expect(!filter.isActive());
 }
 
-test "include exact — whitelist mode" {
+test "include exact - whitelist mode" {
     const include = [_][]const u8{ "db1.t1", "db2.t2" };
     var filter = try TableFilter.init(std.testing.allocator, &include, null);
     defer filter.deinit();
@@ -314,7 +314,7 @@ test "include exact — whitelist mode" {
     try std.testing.expect(!filter.shouldInclude("db3", "t1"));
 }
 
-test "exclude exact — blacklist mode" {
+test "exclude exact - blacklist mode" {
     const exclude = [_][]const u8{"db1.t1"};
     var filter = try TableFilter.init(std.testing.allocator, null, &exclude);
     defer filter.deinit();
@@ -335,7 +335,7 @@ test "exclude schema wildcard (schema.*)" {
     try std.testing.expect(filter.shouldInclude("good_db", "any_table"));
 }
 
-test "include schema wildcard (schema.*) — whitelist" {
+test "include schema wildcard (schema.*) - whitelist" {
     const include = [_][]const u8{"prod_db.*"};
     var filter = try TableFilter.init(std.testing.allocator, &include, null);
     defer filter.deinit();
@@ -489,7 +489,7 @@ test "cross-schema exclude + specific include" {
 }
 
 test "no conflict: different specificity levels allowed" {
-    // exclude schema.*, include schema.table — different specificity, no conflict
+    // exclude schema.*, include schema.table - different specificity, no conflict
     const include = [_][]const u8{"db.table"};
     const exclude = [_][]const u8{"db.*"};
     var filter = try TableFilter.init(std.testing.allocator, &include, &exclude);

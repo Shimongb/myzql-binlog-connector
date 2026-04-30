@@ -19,9 +19,9 @@
 //! }
 //!
 //! `output_dir` layout (when set):
-//!   {output_dir}/state/        — current.json + last_checkpoint.json
-//!   {output_dir}/ddl-cache/    — schema cache (gzipped JSON, content-addressable)
-//!   {output_dir}/data/         — parquet output (when output_mode = parquet)
+//!   {output_dir}/state/        - current.json + last_checkpoint.json
+//!   {output_dir}/ddl-cache/    - schema cache (gzipped JSON, content-addressable)
+//!   {output_dir}/data/         - parquet output (when output_mode = parquet)
 //!
 //! `from_binlog_*` is the genesis position used only when no checkpoint
 //! exists. Once a `last_checkpoint.json` is written, subsequent runs
@@ -46,7 +46,7 @@ pub const table_filter = @import("table_filter.zig");
 const log = std.log.scoped(.config);
 
 /// Subdirectory layout under `output_dir`. Constants (not configurable)
-/// so all three concerns share a single root and stay coupled — losing
+/// so all three concerns share a single root and stay coupled - losing
 /// one without the others would corrupt the resume contract (e.g. cache
 /// files orphaned without their checkpoint key).
 pub const STATE_SUBDIR = "state";
@@ -65,11 +65,11 @@ pub const DEFAULT_CURRENT_STATE_STALENESS_MS: i64 = 90_000;
 /// file.
 pub const DEFAULT_FLUSH_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
 
-/// Lower bound for `flush_size_bytes` — prevents excessive flush
+/// Lower bound for `flush_size_bytes` - prevents excessive flush
 /// thrashing on misconfigured deployments.
 pub const MIN_FLUSH_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
 
-/// Upper bound for `flush_size_bytes` — defence-in-depth against OOM.
+/// Upper bound for `flush_size_bytes` - defence-in-depth against OOM.
 /// 1GB is generous enough for any reasonable Lambda memory tier and
 /// any local-CLI workflow. Tightening per-run via "25% of process
 /// memory budget" is a follow-up once we have a memory-budget config.
@@ -83,6 +83,46 @@ pub const DEFAULT_FLUSH_TIME_GATE_MS: i64 = 10_000; // 10s
 /// Default soft deadline
 pub const DEFAULT_SOFT_DEADLINE_MS: i64 = 90_000; // 90s
 
+/// Result of `parseS3Uri`. Slices point into the input string; caller
+/// must keep that buffer alive for the lifetime of the parsed value.
+/// `prefix` is the empty string when the URI is bucket-only (no path)
+/// - meaning "write directly under bucket root, with subdir constants
+/// (`state/`, `ddl-cache/`, `data/`) as the only key prefix."
+pub const ParsedS3Uri = struct {
+    bucket: []const u8,
+    prefix: []const u8,
+};
+
+pub const S3UriError = error{
+    InvalidS3Uri,
+    BucketNameInvalid,
+};
+
+/// Parse an `s3://bucket[/prefix]` URI. Returns slices into `uri`.
+/// Trims a trailing `/` on the prefix so callers don't end up with
+/// a `//` join when concatenating with the subdir constants.
+///
+/// Bucket-name validation is deliberately loose (length 3..63, the
+/// only constraint that would cause z3's URL construction to misfire);
+/// AWS's full DNS-style rules are enforced server-side and the wrong
+/// shape produces a clear S3 error rather than a silent failure.
+pub fn parseS3Uri(uri: []const u8) S3UriError!ParsedS3Uri {
+    const scheme = "s3://";
+    if (!std.mem.startsWith(u8, uri, scheme)) return S3UriError.InvalidS3Uri;
+    const rest = uri[scheme.len..];
+    if (rest.len == 0) return S3UriError.BucketNameInvalid;
+
+    const slash_at = std.mem.indexOfScalar(u8, rest, '/');
+    const bucket = if (slash_at) |i| rest[0..i] else rest;
+    const prefix_raw = if (slash_at) |i| rest[i + 1 ..] else "";
+    // Trim a trailing slash so `s3://b/p/` and `s3://b/p` parse the same.
+    const prefix = std.mem.trimEnd(u8, prefix_raw, "/");
+
+    if (bucket.len < 3 or bucket.len > 63) return S3UriError.BucketNameInvalid;
+
+    return .{ .bucket = bucket, .prefix = prefix };
+}
+
 /// Output mode for the connector
 pub const OutputMode = enum {
     stdout,
@@ -94,7 +134,7 @@ pub const OutputMode = enum {
 ///
 /// - auto_bool (default): tinyint(1) and bit(1) → `true` / `false`
 /// - auto_int:            tinyint(1) stays integer (unchanged); bit(1) → 1 / 0 integer
-/// - raw:                 preserve legacy behavior — bit columns serialize as hex strings ("0x01")
+/// - raw:                 preserve legacy behavior - bit columns serialize as hex strings ("0x01")
 ///
 /// Only columns whose DESCRIBE-reported type is exactly `tinyint(1)` (optionally
 /// followed by ` unsigned`) or `bit(1)` are coerced. Wider tinyint/bit columns
@@ -177,7 +217,7 @@ pub const Config = struct {
     to_binlog_file: ?[]const u8 = null,
     to_binlog_position: ?u64 = null,
     /// Auto-bound the run when `to_binlog_*` is unset: query master
-    /// position at init and use it as the ceiling. Default `true` —
+    /// position at init and use it as the ceiling. Default `true` -
     /// matches the Lambda-shape "catch up to where master was when we
     /// started, then exit cleanly" model. Local-CLI users who want
     /// forever-streaming should set this to `false`. When `to_binlog_*`
@@ -193,6 +233,16 @@ pub const Config = struct {
     /// - Optional when `output_mode = stdout`. If null, no state files
     ///   and no schema cache are persisted (every run is a cold start).
     output_dir: ?[]const u8 = null,
+    /// S3 destination URI of the form `s3://bucket[/prefix]`. When set,
+    /// the connector uses the S3 ObjectStore backend instead of the
+    /// local filesystem; subdir layout (state/, ddl-cache/, data/) is
+    /// applied as key prefixes under the bucket prefix.
+    /// - Mutually exclusive with `output_dir` (validation rejects both).
+    /// - Required when `output_mode = parquet` if `output_dir` is unset.
+    /// - AWS credentials read from `AWS_ACCESS_KEY_ID` /
+    ///   `AWS_SECRET_ACCESS_KEY` / optional `AWS_SESSION_TOKEN` /
+    ///   optional `AWS_REGION` env vars.
+    s3_uri: ?[]const u8 = null,
     parquet_batch_size: u32 = 8192,
     pipeline_queue_capacity: u32 = 32,
     boolean_encoding: BooleanEncoding = .auto_bool,
@@ -206,7 +256,7 @@ pub const Config = struct {
     /// Staleness threshold for the persisted schema cache, in seconds.
     /// Checked once at bootstrap against the cache file's storage-layer
     /// mtime (local fstat now; S3 HEAD Last-Modified when that backend
-    /// lands). Null (the default) disables the check — any non-empty cache
+    /// lands). Null (the default) disables the check - any non-empty cache
     /// is trusted. A recommended starting value is ~6h; shorter for
     /// DDL-heavy sources, longer for stable schemas.
     schema_cache_ttl_seconds: ?u64 = null,
@@ -219,7 +269,7 @@ pub const Config = struct {
 
     // === Parquet Flush Gate Settings ===
     /// Size gate. Buffered binlog bytes (sum of event_size) above this
-    /// trigger a flush. Bounds-clamped at config load — out-of-range
+    /// trigger a flush. Bounds-clamped at config load - out-of-range
     /// values are clamped with a WARN, not a hard fail.
     flush_size_bytes: u64 = DEFAULT_FLUSH_SIZE_BYTES,
     /// Time gate. Flushes a non-empty buffer after this many ms of
@@ -332,7 +382,7 @@ pub const Config = struct {
             return ConfigError.InvalidPort;
         }
 
-        // Validate binlog start position — both-or-neither, since either alone
+        // Validate binlog start position - both-or-neither, since either alone
         // is ambiguous (file without position vs position without file).
         if ((self.from_binlog_file == null) != (self.from_binlog_position == null)) {
             log.err("validation: from_binlog_file and from_binlog_position must be set together (or both omitted)", .{});
@@ -392,16 +442,32 @@ pub const Config = struct {
             }
         }
 
-        // Parquet mode requires output_dir; stdout mode allows it to be null.
-        if (self.output_mode == .parquet and self.output_dir == null) {
-            log.err("validation: output_mode=parquet requires output_dir", .{});
+        // Output destinations are mutually exclusive.
+        if (self.output_dir != null and self.s3_uri != null) {
+            log.err(
+                "validation: output_dir and s3_uri are mutually exclusive (set exactly one)",
+                .{},
+            );
+            return ConfigError.InvalidFilter;
+        }
+        // s3_uri must parse cleanly when set.
+        if (self.s3_uri) |uri| {
+            _ = parseS3Uri(uri) catch |err| {
+                log.err("validation: s3_uri='{s}' is invalid: {}", .{ uri, err });
+                return ConfigError.InvalidFilter;
+            };
+        }
+        // Parquet mode requires *some* persistent destination; stdout
+        // mode tolerates neither being set.
+        if (self.output_mode == .parquet and self.output_dir == null and self.s3_uri == null) {
+            log.err("validation: output_mode=parquet requires output_dir or s3_uri", .{});
             return ConfigError.InvalidFilter;
         }
 
         // Validate table filter patterns (if any)
         if (self.include != null or self.exclude != null) {
             var filter = table_filter.TableFilter.init(
-                // Use a throwaway allocator — we only care about validation here.
+                // Use a throwaway allocator - we only care about validation here.
                 // The real filter is built in BinlogReader.init().
                 std.heap.page_allocator,
                 self.include,
@@ -423,7 +489,7 @@ pub const Config = struct {
             if (self.database) |db| db else "(none)",
         });
 
-        const from_label: []const u8 = if (self.from_binlog_file) |f| f else "(unset — resolved at runtime)";
+        const from_label: []const u8 = if (self.from_binlog_file) |f| f else "(unset - resolved at runtime)";
         if (self.from_binlog_file != null) {
             const from_pos = self.from_binlog_position.?;
             if (self.to_binlog_file) |to_file| {
@@ -440,7 +506,11 @@ pub const Config = struct {
         }
 
         log.info("output mode: {s}", .{@tagName(self.output_mode)});
-        log.info("output_dir: {s}", .{self.output_dir orelse "(none — no state, no cache)"});
+        if (self.s3_uri) |uri| {
+            log.info("output destination: s3 ({s})", .{uri});
+        } else {
+            log.info("output destination: posix ({s})", .{self.output_dir orelse "(none - no state, no cache)"});
+        }
         if (self.output_mode == .parquet) {
             log.info("parquet: batch_size={d} queue_capacity={d} boolean_encoding={s}", .{
                 self.parquet_batch_size,
@@ -515,7 +585,55 @@ test "config parsing without from_binlog_* (resolved at runtime)" {
 
 // Validation error-path coverage (from_*-both-or-neither, parquet-without-
 // output_dir) is exercised by the integration test rather than unit tests
-// — those rules `log.err` for operators, and Zig 0.16's test runner flags
+// - those rules `log.err` for operators, and Zig 0.16's test runner flags
 // any `err`-level log as a test failure. Lowering the log level would
 // change operator-facing UX, so the rejection paths live with the
 // integration test instead.
+
+test "parseS3Uri: bucket only" {
+    const got = try parseS3Uri("s3://my-bucket");
+    try std.testing.expectEqualStrings("my-bucket", got.bucket);
+    try std.testing.expectEqualStrings("", got.prefix);
+}
+
+test "parseS3Uri: bucket + prefix" {
+    const got = try parseS3Uri("s3://my-bucket/connector/dev1");
+    try std.testing.expectEqualStrings("my-bucket", got.bucket);
+    try std.testing.expectEqualStrings("connector/dev1", got.prefix);
+}
+
+test "parseS3Uri: trailing slash on prefix is trimmed" {
+    const got = try parseS3Uri("s3://my-bucket/connector/");
+    try std.testing.expectEqualStrings("my-bucket", got.bucket);
+    try std.testing.expectEqualStrings("connector", got.prefix);
+}
+
+test "parseS3Uri: bucket-only with trailing slash" {
+    const got = try parseS3Uri("s3://my-bucket/");
+    try std.testing.expectEqualStrings("my-bucket", got.bucket);
+    try std.testing.expectEqualStrings("", got.prefix);
+}
+
+test "parseS3Uri: rejects wrong scheme" {
+    try std.testing.expectError(S3UriError.InvalidS3Uri, parseS3Uri("https://my-bucket"));
+    try std.testing.expectError(S3UriError.InvalidS3Uri, parseS3Uri("my-bucket"));
+    try std.testing.expectError(S3UriError.InvalidS3Uri, parseS3Uri(""));
+}
+
+test "parseS3Uri: rejects empty bucket" {
+    try std.testing.expectError(S3UriError.BucketNameInvalid, parseS3Uri("s3://"));
+    try std.testing.expectError(S3UriError.BucketNameInvalid, parseS3Uri("s3:///prefix"));
+}
+
+test "parseS3Uri: rejects too-short bucket name" {
+    try std.testing.expectError(S3UriError.BucketNameInvalid, parseS3Uri("s3://ab"));
+    try std.testing.expectError(S3UriError.BucketNameInvalid, parseS3Uri("s3://a"));
+}
+
+test "parseS3Uri: rejects too-long bucket name" {
+    // 64 'a's
+    try std.testing.expectError(
+        S3UriError.BucketNameInvalid,
+        parseS3Uri("s3://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    );
+}

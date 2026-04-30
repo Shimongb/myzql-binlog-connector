@@ -36,6 +36,7 @@ const event_parser = @import("event_parser.zig");
 const log_config = @import("log_config.zig");
 const prereq_check = @import("prereq_check.zig");
 const object_store = @import("object_store.zig");
+const s3_store = @import("s3_store.zig");
 const state_mod = @import("state.zig");
 
 const schema_cache_mod = @import("schema_cache.zig");
@@ -50,6 +51,14 @@ const CHECKPOINT_KEY = "last_checkpoint.json";
 fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.now(.real, io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Compose `{user_prefix}/{subdir}` for an S3 key prefix. When the
+/// user supplied no prefix in the s3_uri, returns just the subdir
+/// alone (no leading `/`).
+fn composePrefix(allocator: std.mem.Allocator, user_prefix: []const u8, subdir: []const u8) ![]u8 {
+    if (user_prefix.len == 0) return allocator.dupe(u8, subdir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_prefix, subdir });
 }
 
 /// Install custom log function with runtime level filtering.
@@ -164,7 +173,7 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("MySQL Binlog Connector v0.5.0", .{});
 
-    // Surface where the config path came from — helps ops debug when
+    // Surface where the config path came from - helps ops debug when
     // an env var unexpectedly shadows the CLI arg.
     if (env_config_path != null and config_path != null) {
         log.warn("CONFIG_PATH env var overrides CLI arg ('{s}' wins over '{s}')", .{ cfg_path, config_path.? });
@@ -227,8 +236,8 @@ pub fn main(init: std.process.Init) !void {
     //
     // Order:
     //   1. Resolve `state_dir` and `cache_dir` paths from config.output_dir.
-    //   2. checkLock(current.json) — exit gracefully if a fresh owner is live.
-    //   3. loadCheckpoint(last_checkpoint.json) — `?BinlogState`.
+    //   2. checkLock(current.json) - exit gracefully if a fresh owner is live.
+    //   3. loadCheckpoint(last_checkpoint.json) - `?BinlogState`.
     //   4. Resolve effective start position: checkpoint > config > master.
     //   5. prereq_check on effective position (may adjust to oldest).
     //   6. writeCurrentLock with adjusted position + new run_id.
@@ -236,23 +245,113 @@ pub fn main(init: std.process.Init) !void {
     //   8. loadCacheFromKey(checkpoint.schema_cache_key) if present + fresh.
     // ====================================================================
 
-    var state_dir_path: ?[]const u8 = null;
-    var cache_dir_path: ?[]const u8 = null;
-    var data_dir_path: ?[]const u8 = null;
-    if (config.output_dir) |od| {
-        state_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.STATE_SUBDIR });
-        cache_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DDL_CACHE_SUBDIR });
-        data_dir_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DATA_SUBDIR });
-    }
+    // === Output destination - posix or S3 ===
+    //
+    // Three stores: state (current.json + last_checkpoint.json), cache
+    // (gzipped schema cache files), data (parquet output). All three
+    // share the same backend choice. PosixStore subdirs sit under
+    // `output_dir`; S3Store key prefixes sit under the s3_uri's
+    // optional path component. `*_label_opt` strings are for log
+    // messages only (either local path or `s3://bucket/prefix/...`).
+    //
+    // data_store is constructed here (was previously inside
+    // Pipeline.init); state_store / cache_store keep the same role
+    // they had in Step 4.
 
+    var state_label_opt: ?[]const u8 = null;
+    var cache_label_opt: ?[]const u8 = null;
+    var data_label_opt: ?[]const u8 = null;
     var state_store_opt: ?object_store.ObjectStore = null;
-    if (state_dir_path) |sdp| {
-        state_store_opt = .{ .posix = object_store.PosixStore.init(allocator, sdp) };
+    var cache_store_opt: ?object_store.ObjectStore = null;
+    var data_store_opt: ?object_store.ObjectStore = null;
+
+    // Threaded Io for the std.http.Client inside z3's S3Client.
+    // Lifetime spans all S3Store usage. Initialized only when needed.
+    var threaded_io: std.Io.Threaded = undefined;
+    var threaded_io_initialized = false;
+    defer if (threaded_io_initialized) threaded_io.deinit();
+
+    if (config.s3_uri) |uri| {
+        const parsed = config_mod.parseS3Uri(uri) catch |err| {
+            log.err("[BAD_S3_URI] config s3_uri='{s}' failed to parse: {}", .{ uri, err });
+            return err;
+        };
+        const bucket_owned = try allocator.dupe(u8, parsed.bucket);
+
+        const env_map = init.environ_map;
+        const access_id = env_map.get("AWS_ACCESS_KEY_ID") orelse {
+            log.err(
+                "[MISSING_AWS_CREDS] AWS_ACCESS_KEY_ID env var is required when config.s3_uri is set",
+                .{},
+            );
+            return error.MissingAwsCredentials;
+        };
+        const secret = env_map.get("AWS_SECRET_ACCESS_KEY") orelse {
+            log.err(
+                "[MISSING_AWS_CREDS] AWS_SECRET_ACCESS_KEY env var is required when config.s3_uri is set",
+                .{},
+            );
+            return error.MissingAwsCredentials;
+        };
+        const session_token = env_map.get("AWS_SESSION_TOKEN");
+        const region = env_map.get("AWS_REGION") orelse "us-east-1";
+
+        // Build prefix strings: `{user_prefix}/{subdir}` (or just `{subdir}`
+        // if user_prefix is empty).
+        const state_prefix = try composePrefix(allocator, parsed.prefix, config_mod.STATE_SUBDIR);
+        const cache_prefix = try composePrefix(allocator, parsed.prefix, config_mod.DDL_CACHE_SUBDIR);
+        const data_prefix = try composePrefix(allocator, parsed.prefix, config_mod.DATA_SUBDIR);
+
+        // Creds struct lives inside each S3Store via copy; its strings
+        // are env-owned and stay alive for the whole process.
+        const creds: s3_store.Creds = .{
+            .access_key_id = access_id,
+            .secret_access_key = secret,
+            .session_token = session_token,
+            .region = region,
+        };
+
+        threaded_io = std.Io.Threaded.init(gpa.allocator(), .{ .environ = init.minimal.environ });
+        threaded_io_initialized = true;
+        const io = threaded_io.io();
+
+        state_store_opt = .{ .s3 = try s3_store.S3Store.init(allocator, bucket_owned, state_prefix, creds, io) };
+        cache_store_opt = .{ .s3 = try s3_store.S3Store.init(allocator, bucket_owned, cache_prefix, creds, io) };
+        data_store_opt = .{ .s3 = try s3_store.S3Store.init(allocator, bucket_owned, data_prefix, creds, io) };
+
+        state_label_opt = try std.fmt.allocPrint(allocator, "s3://{s}/{s}", .{ bucket_owned, state_prefix });
+        cache_label_opt = try std.fmt.allocPrint(allocator, "s3://{s}/{s}", .{ bucket_owned, cache_prefix });
+        data_label_opt = try std.fmt.allocPrint(allocator, "s3://{s}/{s}", .{ bucket_owned, data_prefix });
+    } else if (config.output_dir) |od| {
+        state_label_opt = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.STATE_SUBDIR });
+        cache_label_opt = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DDL_CACHE_SUBDIR });
+        data_label_opt = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ od, config_mod.DATA_SUBDIR });
+        state_store_opt = .{ .posix = object_store.PosixStore.init(allocator, state_label_opt.?) };
+        cache_store_opt = .{ .posix = object_store.PosixStore.init(allocator, cache_label_opt.?) };
+        data_store_opt = .{ .posix = object_store.PosixStore.init(allocator, data_label_opt.?) };
     }
 
-    var cache_store_opt: ?object_store.ObjectStore = null;
-    if (cache_dir_path) |cdp| {
-        cache_store_opt = .{ .posix = object_store.PosixStore.init(allocator, cdp) };
+    // probeWritable on each store before any real state-touching
+    // ops. Catches permission / route / IAM gaps with a clear error
+    // line at startup instead of failing 30s later inside the lock
+    // claim or first parquet flush.
+    if (state_store_opt) |*ss| {
+        ss.probeWritable(allocator) catch |err| {
+            log.err("[OUTPUT_NOT_WRITABLE] state store probe failed at '{s}': {}", .{ state_label_opt.?, err });
+            return err;
+        };
+    }
+    if (cache_store_opt) |*ss| {
+        ss.probeWritable(allocator) catch |err| {
+            log.err("[OUTPUT_NOT_WRITABLE] cache store probe failed at '{s}': {}", .{ cache_label_opt.?, err });
+            return err;
+        };
+    }
+    if (data_store_opt) |*ss| {
+        ss.probeWritable(allocator) catch |err| {
+            log.err("[OUTPUT_NOT_WRITABLE] data store probe failed at '{s}': {}", .{ data_label_opt.?, err });
+            return err;
+        };
     }
 
     // Inspect current.json. Skip the run if a live owner is detected.
@@ -260,7 +359,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (maybe_checkpoint) |s| s.deinit(allocator);
 
     if (state_store_opt) |*store| {
-        log.info("checking for existing execution state at {s}/{s}", .{ state_dir_path.?, CURRENT_KEY });
+        log.info("checking for existing execution state at {s}/{s}", .{ state_label_opt.?, CURRENT_KEY });
         const lock_check = state_mod.checkLock(
             allocator,
             store,
@@ -274,23 +373,23 @@ pub fn main(init: std.process.Init) !void {
         defer if (lock_check.prior_state) |s| s.deinit(allocator);
 
         switch (lock_check.outcome) {
-            .acquired_fresh => log.info("no prior state — fresh execution", .{}),
+            .acquired_fresh => log.info("no prior state - fresh execution", .{}),
             .acquired_stale_predecessor => {
                 if (lock_check.prior_state) |s| {
                     const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
                     log.warn(
-                        "found stale state (run_id: {s}, age: {d}s); assuming crashed predecessor — will resume from checkpoint",
+                        "found stale state (run_id: {s}, age: {d}s); assuming crashed predecessor - will resume from checkpoint",
                         .{ s.run_id, age_s },
                     );
                 } else {
-                    log.warn("found malformed state file; assuming crashed predecessor — will resume from checkpoint", .{});
+                    log.warn("found malformed state file; assuming crashed predecessor - will resume from checkpoint", .{});
                 }
             },
             .skip_live_owner => {
                 if (lock_check.prior_state) |s| {
                     const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
                     log.warn(
-                        "found recent in-progress state (run_id: {s}, age: {d}s) — skipping execution to avoid duplication",
+                        "found recent in-progress state (run_id: {s}, age: {d}s) - skipping execution to avoid duplication",
                         .{ s.run_id, age_s },
                     );
                 }
@@ -309,20 +408,20 @@ pub fn main(init: std.process.Init) !void {
         effective_file = cp.binlog_file;
         effective_pos = cp.binlog_position;
         log.info(
-            "found last checkpoint: {s}:{d} — config.from_binlog_* values are ignored. Delete {s}/{s} to force restart from config.",
-            .{ cp.binlog_file, cp.binlog_position, state_dir_path.?, CHECKPOINT_KEY },
+            "found last checkpoint: {s}:{d} - config.from_binlog_* values are ignored. Delete {s}/{s} to force restart from config.",
+            .{ cp.binlog_file, cp.binlog_position, state_label_opt.?, CHECKPOINT_KEY },
         );
     } else if (config.from_binlog_file) |cf| {
         effective_file = cf;
         effective_pos = config.from_binlog_position.?;
-        log.info("no checkpoint — bootstrapping from config: {s}:{d}", .{ effective_file, effective_pos });
+        log.info("no checkpoint - bootstrapping from config: {s}:{d}", .{ effective_file, effective_pos });
     } else {
         log.info("no checkpoint and no config.from_binlog_*; querying master position", .{});
         const mp = prereq_check.getMasterPosition(allocator, &conn) catch |err| {
             log.err(
                 "[MISSING_START_POSITION] cannot determine binlog start position. Tried: (1) {s}/{s} (not found), (2) config.from_binlog_* (not set), (3) SHOW MASTER STATUS ({}). Set config.from_binlog_file/position or ensure binlog is enabled on the server.",
                 .{
-                    state_dir_path orelse "(state files disabled — set output_dir to enable resume)",
+                    state_label_opt orelse "(state files disabled - set output_dir to enable resume)",
                     CHECKPOINT_KEY,
                     err,
                 },
@@ -375,7 +474,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Claim the lock with the post-adjust position. Only happens after
-    // we've committed to running — prereq failures leave no stale lock.
+    // we've committed to running - prereq failures leave no stale lock.
     var run_id: ?[]u8 = null;
     if (state_store_opt) |*store| {
         const id = try state_mod.generateRunId(allocator);
@@ -385,13 +484,13 @@ pub fn main(init: std.process.Init) !void {
             .binlog_position = prereq.position,
             .updated_at_ms = nowMs(init.io),
             .run_id = id,
-            // Carry the predecessor's cache key forward — if we crash
+            // Carry the predecessor's cache key forward - if we crash
             // before writing a new cache, the next run still has a key.
             .schema_cache_key = if (maybe_checkpoint) |cp| cp.schema_cache_key else null,
             .is_in_progress = true,
         };
         try state_mod.writeCurrentLock(allocator, store, CURRENT_KEY, lock_state);
-        log.info("claimed lock at {s}/{s} (run_id: {s})", .{ state_dir_path.?, CURRENT_KEY, id });
+        log.info("claimed lock at {s}/{s} (run_id: {s})", .{ state_label_opt.?, CURRENT_KEY, id });
     }
 
     // Create secondary connection for DESCRIBE queries (column name resolution)
@@ -426,7 +525,7 @@ pub fn main(init: std.process.Init) !void {
     defer reader.deinit();
 
     // Load schema cache by the key from the checkpoint (if any). TTL check
-    // is opt-in — if the cache key has aged past `schema_cache_ttl_seconds`,
+    // is opt-in - if the cache key has aged past `schema_cache_ttl_seconds`,
     // skip the load and cold-start the cache (position still resumes).
     if (cache_store_opt) |*store| {
         if (maybe_checkpoint) |cp| {
@@ -481,8 +580,10 @@ pub fn main(init: std.process.Init) !void {
             };
         },
         .parquet => {
-            // Validation guarantees output_dir is set when output_mode = parquet.
-            const parquet_dir = data_dir_path.?;
+            // Validation guarantees output_dir or s3_uri is set when
+            // output_mode = parquet, so the data store + label are
+            // always non-null here.
+            const parquet_label = data_label_opt.?;
 
             // State store + run_id pointers for the pipeline's mid-run
             // checkpoint hook. Both are guaranteed non-null in parquet
@@ -494,7 +595,8 @@ pub fn main(init: std.process.Init) !void {
 
             var pipe = pipeline_mod.Pipeline.init(.{
                 .allocator = gpa.allocator(),
-                .output_dir = parquet_dir,
+                .data_store = &data_store_opt.?,
+                .data_label = parquet_label,
                 .initial_binlog_file = prereq.file,
                 .batch_size = config.parquet_batch_size,
                 .event_queue_capacity = config.pipeline_queue_capacity,
@@ -606,24 +708,24 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    // ====== CLEAN SHUTDOWN — Step 4 ======
+    // ====== CLEAN SHUTDOWN - Step 4 ======
     // Order matters:
     //   1. saveCache → returns the content-addressable cache key.
     //   2. writeCheckpoint with final {file, position, cache_key}.
-    //   3. releaseLock (best-effort — failures are non-fatal).
+    //   3. releaseLock (best-effort - failures are non-fatal).
     //
     // Failures in (1) or (2) propagate. (3) is best-effort because the
     // next run's stale-detection handles a leftover lock anyway.
     //
     // Error paths above (any `return err`) deliberately skip both (2)
-    // and (3) — leaving current.json in place is the crash signal that
+    // and (3) - leaving current.json in place is the crash signal that
     // tells the next run "predecessor died, resume from checkpoint."
 
     var saved_cache_key: ?[]const u8 = null;
     if (cache_store_opt) |*store| {
         if (reader.schema_cache.count() > 0) {
             saved_cache_key = cache_persistence.saveCache(allocator, &reader.schema_cache, store, init.io) catch |err| blk: {
-                log.warn("failed to save schema cache: {} — checkpoint will not reference a cache", .{err});
+                log.warn("failed to save schema cache: {} - checkpoint will not reference a cache", .{err});
                 break :blk null;
             };
         }
@@ -644,7 +746,7 @@ pub fn main(init: std.process.Init) !void {
         };
         log.info(
             "wrote checkpoint at {s}/{s}: {s}:{d}",
-            .{ state_dir_path.?, CHECKPOINT_KEY, reader.current_binlog_file, reader.current_position },
+            .{ state_label_opt.?, CHECKPOINT_KEY, reader.current_binlog_file, reader.current_position },
         );
 
         state_mod.releaseLock(store, CURRENT_KEY);
