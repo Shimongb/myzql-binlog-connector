@@ -1,20 +1,20 @@
 //! Storage-backend abstraction.
 //!
-//! Today: `PosixStore` — filesystem-backed, wraps the raw `std.posix` calls
+//! Today: `PosixStore` - filesystem-backed, wraps the raw `std.posix` calls
 //! the rest of the codebase already uses. Later (Track 3 of the Lambda
-//! vision doc): `S3Store` — HTTPS via the forked z3 SDK. Both implement
+//! vision doc): `S3Store` - HTTPS via the forked z3 SDK. Both implement
 //! the same small surface so parquet-writer and schema-cache can be
 //! migrated once and run unchanged against either backend.
 //!
 //! Surface:
-//! - `create(key) -> WriteHandle` — streaming writer, commits on close
-//! - `read(key) -> []u8`          — full read; fine for cache/state
-//! - `head(key) -> HeadInfo`      — size + last-modified
-//! - `delete(key)`                — best-effort remove
+//! - `create(key) -> WriteHandle` - streaming writer, commits on close
+//! - `read(key) -> []u8`          - full read; fine for cache/state
+//! - `head(key) -> HeadInfo`      - size + last-modified
+//! - `delete(key)`                - best-effort remove
 //!
 //! Not part of the interface:
 //! - Directory semantics, random-access seek, rename, file modes.
-//! - `list(prefix)` — schema-cache pruning used to motivate it, but
+//! - `list(prefix)` - schema-cache pruning used to motivate it, but
 //!   content-addressable naming retires that use case.
 //!
 //! Write atomicity: PosixStore writes to a `<key>.<pid>.<ns>.tmp` sidecar
@@ -29,6 +29,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const s3_store = @import("s3_store.zig");
 
 const log = std.log.scoped(.object_store);
 
@@ -50,7 +51,7 @@ fn currentMillis() i64 {
     return @intCast(@divTrunc(currentNanos(), std.time.ns_per_ms));
 }
 
-/// Canonical error set. Narrow on purpose — callers want "did it work"
+/// Canonical error set. Narrow on purpose - callers want "did it work"
 /// first and "why" second; mapping POSIX errno and S3 HTTP status families
 /// into this small set gives us a common vocabulary.
 pub const Error = error{
@@ -73,68 +74,118 @@ pub const HeadInfo = struct {
 /// visible atomically; `abort()` discards the sidecar. Not thread-safe.
 pub const WriteHandle = union(enum) {
     posix: PosixWriteHandle,
+    s3: s3_store.S3WriteHandle,
 
     pub fn write(self: *WriteHandle, data: []const u8) Error!void {
         return switch (self.*) {
             .posix => |*h| h.write(data),
+            .s3 => |*h| h.write(data),
         };
     }
 
     pub fn commit(self: *WriteHandle) Error!void {
         return switch (self.*) {
             .posix => |*h| h.commit(),
+            .s3 => |*h| h.commit(),
         };
     }
 
     pub fn abort(self: *WriteHandle) void {
         switch (self.*) {
             .posix => |*h| h.abort(),
+            .s3 => |*h| h.abort(),
         }
     }
 };
 
-/// Dispatch wrapper. Tagged union (not vtable) because we currently have
-/// exactly one backend and extending the union is an additive change when
-/// S3 lands. Revisit if the import graph gets hairy.
+/// Dispatch wrapper. Tagged union: posix (filesystem) or s3 (HTTPS via
+/// the z3 SDK). Adding backends is additive - extend the union and add
+/// switch arms here.
 pub const ObjectStore = union(enum) {
     posix: PosixStore,
+    s3: s3_store.S3Store,
 
     pub fn create(self: *ObjectStore, key: []const u8) Error!WriteHandle {
         return switch (self.*) {
             .posix => |*s| .{ .posix = try s.create(key) },
+            .s3 => |*s| .{ .s3 = try s.create(key) },
         };
     }
 
     pub fn read(self: *ObjectStore, allocator: std.mem.Allocator, key: []const u8) Error![]u8 {
         return switch (self.*) {
             .posix => |*s| s.read(allocator, key),
+            .s3 => |*s| s.read(allocator, key),
         };
     }
 
     pub fn head(self: *ObjectStore, key: []const u8) Error!HeadInfo {
         return switch (self.*) {
             .posix => |*s| s.head(key),
+            .s3 => |*s| s.head(key),
         };
     }
 
     pub fn delete(self: *ObjectStore, key: []const u8) Error!void {
         return switch (self.*) {
             .posix => |*s| s.delete(key),
+            .s3 => |*s| s.delete(key),
         };
     }
 
     /// Commit a streaming write under a destination key that can only
     /// be computed at close time (e.g. parquet filenames whose to_pos
     /// component isn't known until the last batch is written). Overrides
-    /// the handle's final key, ensures the new parent directory exists,
-    /// then performs the atomic rename. The handle becomes unusable
-    /// after the call — same lifecycle as `commit`/`abort`.
+    /// the handle's final key, ensures the new parent dir exists (posix)
+    /// or composes the new key under the S3 prefix (s3), then commits.
+    /// The handle becomes unusable after the call - same lifecycle as
+    /// `commit`/`abort`.
+    ///
+    /// Cross-backend handle/store pairs (e.g. posix handle with s3
+    /// store) are programmer errors - the handle was created by the
+    /// store, so they always match. We `unreachable` rather than
+    /// converting at runtime.
     pub fn commitHandleAs(self: *ObjectStore, handle: *WriteHandle, new_key: []const u8) Error!void {
         return switch (handle.*) {
             .posix => |*h| switch (self.*) {
                 .posix => |*s| h.commitAs(s.root_dir, new_key),
+                .s3 => unreachable,
+            },
+            .s3 => |*h| switch (self.*) {
+                // S3WriteHandle.commitAs ignores its first arg (posix-only
+                // concept). Pass the bucket for symmetry; it's not used.
+                .s3 => |*s| h.commitAs(s.bucket, new_key),
+                .posix => unreachable,
             },
         };
+    }
+
+    /// Writability probe - round-trips a tiny self-deleting object to
+    /// catch permission / route / IAM-policy gaps at startup, before
+    /// any real state-touching writes happen. Cheap (one create+commit+
+    /// delete cycle, ~ms posix / sub-second S3) and worth it: a
+    /// state-lock failure 30s later is much harder to debug than an
+    /// `[OUTPUT_NOT_WRITABLE]` line at startup.
+    pub fn probeWritable(self: *ObjectStore, allocator: std.mem.Allocator) Error!void {
+        var key_buf: [64]u8 = undefined;
+        const probe_key = std.fmt.bufPrint(
+            &key_buf,
+            ".probe-{d}",
+            .{currentMillis()},
+        ) catch return Error.Io;
+
+        var h = try self.create(probe_key);
+        errdefer h.abort();
+        try h.write("probe");
+        try h.commit();
+
+        self.delete(probe_key) catch |err| {
+            log.warn(
+                "probe-write succeeded but delete failed (orphan key '{s}' may need manual cleanup): {}",
+                .{ probe_key, err },
+            );
+        };
+        _ = allocator; // currently unused; kept on signature for future per-call alloc needs
     }
 };
 
@@ -161,7 +212,7 @@ pub const PosixStore = struct {
 
         try ensureParentDir(self.allocator, final_path);
 
-        // Sidecar name: <final>.<pid>.<nanos>.tmp — collision-free under
+        // Sidecar name: <final>.<pid>.<nanos>.tmp - collision-free under
         // concurrent writers from multiple processes on the same key.
         const pid: i32 = @intCast(posix.system.getpid());
         const temp_path = std.fmt.allocPrint(
@@ -209,7 +260,7 @@ pub const PosixStore = struct {
         var total: usize = 0;
         while (total < buf.len) {
             const n = posix.read(fd, buf[total..]) catch return Error.Io;
-            if (n == 0) break; // unexpected EOF — return what we have
+            if (n == 0) break; // unexpected EOF - return what we have
             total += n;
         }
         if (total != buf.len) {
@@ -288,7 +339,7 @@ pub const PosixWriteHandle = struct {
         self.closed = true;
 
         // rename(2) is atomic when source and destination are on the same
-        // filesystem — which they always are here since both live under
+        // filesystem - which they always are here since both live under
         // the store's root_dir.
         const temp_z = self.allocator.dupeZ(u8, self.temp_path) catch {
             self.cleanupPaths();
@@ -652,7 +703,7 @@ test "ObjectStore: commitHandleAs renames to a different final key on commit" {
 
     var store: ObjectStore = .{ .posix = PosixStore.init(allocator, root_owned) };
 
-    // Open with a placeholder key, then commit to a different one — the
+    // Open with a placeholder key, then commit to a different one - the
     // exact pattern the parquet flush worker uses when to_pos is unknown
     // at file-open time.
     var h = try store.create("placeholder.partial");
@@ -689,4 +740,25 @@ test "ObjectStore: commitHandleAs rejects an invalid destination key" {
     // Handle is unusable after a failed commit attempt; clean up the
     // sidecar so we don't leak a temp file.
     h.abort();
+}
+
+test "ObjectStore: probeWritable round-trips on PosixStore" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root_owned = try allocator.dupe(u8, path_buf[0..root_len]);
+    defer allocator.free(root_owned);
+
+    var store: ObjectStore = .{ .posix = PosixStore.init(allocator, root_owned) };
+
+    // Round-trip without error: create, write, commit, delete.
+    try store.probeWritable(allocator);
+
+    // Repeat probes use unique timestamped keys; two in a row should
+    // both succeed independently.
+    try store.probeWritable(allocator);
 }

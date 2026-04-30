@@ -2,7 +2,7 @@
 //!
 //! A bounded, multi-producer single-consumer queue backed by a ring buffer.
 //! Uses atomic spinlock + spin-wait for blocking push/pop semantics.
-//! No libc dependency — works on bare Linux and macOS alike.
+//! No libc dependency - works on bare Linux and macOS alike.
 //! Supports graceful shutdown via close().
 
 const std = @import("std");
@@ -20,7 +20,7 @@ pub fn MpscQueue(comptime T: type) type {
         spin: SpinLock,
         allocator: std.mem.Allocator,
 
-        /// Simple atomic spinlock — no libc needed.
+        /// Simple atomic spinlock - no libc needed.
         const SpinLock = struct {
             state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -71,7 +71,7 @@ pub fn MpscQueue(comptime T: type) type {
                     return true;
                 }
 
-                // Queue full — release lock, spin-wait, retry
+                // Queue full - release lock, spin-wait, retry
                 self.spin.unlock();
                 std.atomic.spinLoopHint();
             }
@@ -95,7 +95,7 @@ pub fn MpscQueue(comptime T: type) type {
                     return null; // closed and empty
                 }
 
-                // Queue empty — release lock, spin-wait, retry
+                // Queue empty - release lock, spin-wait, retry
                 self.spin.unlock();
                 std.atomic.spinLoopHint();
             }

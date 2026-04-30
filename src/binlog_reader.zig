@@ -66,7 +66,7 @@ pub const BinlogReader = struct {
 
     /// Initialize binlog reader with a connection and optional secondary
     /// connection for DESCRIBE. `start_file`/`start_position` are the
-    /// resolved start position — caller (main.zig) decides whether they
+    /// resolved start position - caller (main.zig) decides whether they
     /// come from a checkpoint, config, or `SHOW MASTER STATUS`.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -241,7 +241,7 @@ pub const BinlogReader = struct {
                 // logs don't show two "rotation" lines per real boundary.
                 const same_file = std.mem.eql(u8, rotate.next_binlog_file, self.current_binlog_file);
                 if (same_file) {
-                    log.debug("binlog rotation: same target ({s}) — fake rotate suppressed", .{rotate.next_binlog_file});
+                    log.debug("binlog rotation: same target ({s}) - fake rotate suppressed", .{rotate.next_binlog_file});
                 } else {
                     log.info("binlog rotation: next_file={s}", .{rotate.next_binlog_file});
                 }
@@ -435,7 +435,7 @@ pub const BinlogReader = struct {
 
                 // Detect the "fake" rotate the server sometimes emits at
                 // the start of a binlog stream (or right after a real
-                // rotate) — same target as our current file. Suppressing
+                // rotate) - same target as our current file. Suppressing
                 // it prevents the pipeline from spuriously splitting a
                 // single binlog file's row events across multiple
                 // parquet files, which produces overlapping from/to
@@ -447,7 +447,7 @@ pub const BinlogReader = struct {
                 self.current_position = rotate.next_position;
 
                 if (same_file) {
-                    log.debug("binlog rotation: same target ({s}) — suppressing duplicate rotate", .{rotate.next_binlog_file});
+                    log.debug("binlog rotation: same target ({s}) - suppressing duplicate rotate", .{rotate.next_binlog_file});
                     self.allocator.free(rotate.next_binlog_file);
                     return .skip;
                 }

@@ -8,10 +8,6 @@
 const std = @import("std");
 
 // Re-export modules that might be useful as a library
-// NOTE: These will be uncommented as we implement each phase
-// pub const config = @import("config.zig");
-// pub const connection = @import("connection.zig");
-// pub const binlog = @import("binlog_reader.zig");
 pub const schema_cache = @import("schema_cache.zig");
 pub const ddl_handler = @import("ddl_handler.zig");
 pub const cache_persistence = @import("cache_persistence.zig");
@@ -19,6 +15,7 @@ pub const prereq_check = @import("prereq_check.zig");
 pub const object_store = @import("object_store.zig");
 pub const state = @import("state.zig");
 pub const config = @import("config.zig");
+pub const s3_store = @import("s3_store.zig");
 
 test "root module" {
     // Placeholder test
@@ -34,4 +31,5 @@ comptime {
     _ = object_store;
     _ = state;
     _ = config;
+    _ = s3_store;
 }

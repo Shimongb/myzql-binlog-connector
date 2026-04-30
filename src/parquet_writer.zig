@@ -134,7 +134,7 @@ pub const ParquetWriter = struct {
     // avoids emitting zero-row parquet files on binlog rotations that carry
     // no DML (e.g. idle segments). An empty-but-valid parquet is still
     // readable individually, but mixing them into a directory glob makes
-    // downstream readers iterate extra files for no benefit — and a broken
+    // downstream readers iterate extra files for no benefit - and a broken
     // empty file (pre-0.16 gzip bug) would poison the whole glob.
     //
     // Writes go through ObjectStore.WriteHandle: a sidecar temp file is
@@ -242,7 +242,7 @@ pub const ParquetWriter = struct {
 
         // Write uncompressed data through compressor.
         // NOTE: Zig 0.16.0's std.compress.flate splits stream termination into
-        // two steps — `flush` only sync-aligns buffered bytes, while `finish`
+        // two steps - `flush` only sync-aligns buffered bytes, while `finish`
         // emits the final deflate block *and* the gzip trailer (CRC32+ISIZE).
         // Using `flush` here produced truncated gzip streams that downstream
         // readers (DuckDB, Python gzip) rejected with "data error" / "ended
@@ -427,7 +427,7 @@ pub const ParquetWriter = struct {
     }
 
     /// Optional rename target for `finishAs`. When supplied, the handle's
-    /// final key is overridden at commit time — used by flush
+    /// final key is overridden at commit time - used by flush
     /// gates, where the parquet filename includes a `to_pos` component
     /// that's only known once the last batch has been written.
     pub const RenameTarget = struct {
@@ -455,7 +455,7 @@ pub const ParquetWriter = struct {
 
     fn finishInner(self: *ParquetWriter, rename_to: ?RenameTarget) !void {
         // If no row groups were written, discard any in-flight sidecar and
-        // skip the footer — the output directory stays free of zero-row
+        // skip the footer - the output directory stays free of zero-row
         // parquets. Downstream readers using `dir/*.parquet` globs would
         // otherwise have to open (and tolerate) empty files on every rotate.
         if (self.write_handle == null or self.row_groups.items.len == 0) {
@@ -583,7 +583,7 @@ pub const ParquetWriter = struct {
         self.bytes_written += footer_data.len + 4 + 4;
 
         // Commit: close + atomic rename. After this, the write handle is
-        // finalized — null it out so deinit() doesn't double-cleanup.
+        // finalized - null it out so deinit() doesn't double-cleanup.
         // On commit failure the abstraction already cleans up the sidecar;
         // we still null the handle so the caller's defer deinit() is safe.
         defer self.write_handle = null;

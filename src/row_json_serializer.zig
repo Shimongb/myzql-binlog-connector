@@ -184,7 +184,7 @@ pub const RowJsonSerializer = struct {
     }
 
     /// Matches `tinyint(1)` (optionally followed by ` unsigned` / ` zerofill`)
-    /// and `bit(1)` — the two MySQL column types that canonically mean BOOL.
+    /// and `bit(1)` - the two MySQL column types that canonically mean BOOL.
     /// Deliberately does NOT match `tinyint(10)`, `tinyint(11)`, etc.
     fn columnTypeIsBool1(column_type: []const u8) bool {
         const tinyint1 = "tinyint(1)";

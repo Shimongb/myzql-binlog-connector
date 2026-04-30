@@ -1,8 +1,8 @@
 //! Binlog state files.
 //!
 //! Two-file pattern, agnostic of FS vs S3 via ObjectStore:
-//!   - current.json          — the lock; written at init, deleted at clean exit.
-//!   - last_checkpoint.json  — durable truth; written at clean shutdown.
+//!   - current.json          - the lock; written at init, deleted at clean exit.
+//!   - last_checkpoint.json  - durable truth; written at clean shutdown.
 //!
 //! `current.json` aging past `staleness_ms` means the previous owner crashed.
 //! `last_checkpoint.json` is what new runs read to decide where to resume.
@@ -18,7 +18,7 @@ const log = std.log.scoped(.state);
 
 /// Fill buffer with cryptographically-secure random bytes.
 /// Linux: getrandom syscall directly; macOS/BSD: arc4random_buf via
-/// std.posix.system. Mirrors the helper in src/mysql/auth.zig — kept
+/// std.posix.system. Mirrors the helper in src/mysql/auth.zig - kept
 /// local to avoid pulling auth.zig into the state module's import graph.
 fn fillRandomBytes(buf: []u8) void {
     if (comptime builtin.os.tag == .linux) {
@@ -61,12 +61,12 @@ pub const BinlogState = struct {
 };
 
 pub const LockOutcome = enum {
-    /// No prior current.json existed — fresh first run.
+    /// No prior current.json existed - fresh first run.
     acquired_fresh,
     /// Prior current.json was stale (older than staleness_ms); previous
     /// owner is presumed crashed. Caller should resume from checkpoint.
     acquired_stale_predecessor,
-    /// Prior current.json is fresh — another owner is active.
+    /// Prior current.json is fresh - another owner is active.
     /// Caller should exit gracefully (idempotency).
     skip_live_owner,
 };
@@ -81,7 +81,7 @@ pub const LockResult = struct {
 };
 
 /// Inspect current.json and decide acquire/skip. Does NOT write the new
-/// lock — caller composes a fresh BinlogState (with their own run_id and
+/// lock - caller composes a fresh BinlogState (with their own run_id and
 /// timestamp) and calls `writeCurrentLock`.
 ///
 /// Decision tree:
@@ -89,7 +89,7 @@ pub const LockResult = struct {
 ///   - current.json present, parses, age within staleness_ms → skip_live_owner
 ///   - current.json present, parses, age beyond staleness_ms → acquired_stale_predecessor
 ///   - current.json present but malformed → log WARN, treat as acquired_stale_predecessor
-///     (predecessor wrote a corrupt file — that's still a crash signal)
+///     (predecessor wrote a corrupt file - that's still a crash signal)
 ///
 /// Negative age (now_ms < updated_at_ms) is treated as live-owner; that's
 /// clock skew on a foreign writer, safer to back off than barge in.
@@ -167,7 +167,7 @@ pub fn writeCheckpoint(
 }
 
 /// Best-effort delete of current.json. Failures are logged but never
-/// propagated — the next run's stale-detection handles a leftover lock.
+/// propagated - the next run's stale-detection handles a leftover lock.
 pub fn releaseLock(store: *object_store.ObjectStore, current_key: []const u8) void {
     store.delete(current_key) catch |err| switch (err) {
         object_store.Error.NotFound => {},
@@ -190,7 +190,7 @@ pub fn generateRunId(allocator: std.mem.Allocator) ![]u8 {
 
 /// Generate a UUIDv7 string. UUIDv7 (RFC 9562) embeds a 48-bit big-
 /// endian millisecond timestamp in the leading bytes, so two UUIDs
-/// generated milliseconds apart sort lexically — useful as a tail in
+/// generated milliseconds apart sort lexically - useful as a tail in
 /// time-bucketed filenames where lexical sort = chronological sort.
 ///
 /// Layout (hyphens at the standard 8-4-4-4-12 positions):
@@ -438,7 +438,7 @@ test "checkLock: fresh current.json returns skip_live_owner" {
     };
     try writeCurrentLock(allocator, &store, "current.json", lock);
 
-    // 60s after owner wrote — still within 90s staleness.
+    // 60s after owner wrote - still within 90s staleness.
     const result = try checkLock(allocator, &store, "current.json", 90_000, 1_060_000);
     defer if (result.prior_state) |s| s.deinit(allocator);
 
@@ -469,7 +469,7 @@ test "checkLock: stale current.json returns acquired_stale_predecessor" {
     };
     try writeCurrentLock(allocator, &store, "current.json", lock);
 
-    // 5min after — well past 90s staleness.
+    // 5min after - well past 90s staleness.
     const result = try checkLock(allocator, &store, "current.json", 90_000, 1_300_000);
     defer if (result.prior_state) |s| s.deinit(allocator);
 
@@ -600,7 +600,7 @@ test "releaseLock removes current.json; idempotent on missing" {
     releaseLock(&store, "current.json");
     try testing.expectError(object_store.Error.NotFound, store.head("current.json"));
 
-    // Idempotent — calling again on a missing file must not crash or error.
+    // Idempotent - calling again on a missing file must not crash or error.
     releaseLock(&store, "current.json");
 }
 
