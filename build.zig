@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Link libc only on platforms that require it (macOS has no stable syscall ABI).
-    // On Linux, we use direct syscalls via std.os.linux — no libc needed.
+    // On Linux, we use direct syscalls via std.os.linux - no libc needed.
     const needs_libc = target.result.os.tag.isDarwin();
 
     // === SQL PARSER DEPENDENCY ===
@@ -35,6 +35,11 @@ pub fn build(b: *std.Build) void {
     const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
     const tls_mod = tls_dep.module("tls");
 
+    // === S3 DEPENDENCY (codeberg.org/fellowtraveler/z3) ===
+    // Async S3 client built on std.http.Client + std.Io.
+    const z3_dep = b.dependency("z3", .{ .target = target, .optimize = optimize });
+    const z3_mod = z3_dep.module("s3");
+
     // Create library module (optional - for reuse in other Zig projects)
     const mod = b.addModule("myzql_binlog_connector", .{
         .root_source_file = b.path("src/root.zig"),
@@ -44,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "myzqlparser", .module = myzqlparser_mod },
             .{ .name = "tls", .module = tls_mod },
+            .{ .name = "s3", .module = z3_mod },
         },
     });
 
@@ -59,6 +65,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "myzql_binlog_connector", .module = mod },
                 .{ .name = "myzqlparser", .module = myzqlparser_mod },
                 .{ .name = "tls", .module = tls_mod },
+                .{ .name = "s3", .module = z3_mod },
             },
         }),
     });
