@@ -205,7 +205,7 @@ The connector reads a JSON configuration file passed as the sole CLI argument.
 `from_binlog_*` is optional. If omitted, the connector resolves the start
 position at runtime via the chain **checkpoint > config > master query**
 (see [State Files & Resume](#state-files--resume)). `to_binlog_*` is also
-optional — when both are unset and `bound_to_master_at_init` is on
+optional - when both are unset and `bound_to_master_at_init` is on
 (default), the run is auto-bounded to the master position captured at
 init.
 
@@ -230,14 +230,62 @@ init.
 }
 ```
 
-Parquet mode requires `output_dir`. The connector creates three
-subdirectories under it:
+Parquet mode requires either `output_dir` (local filesystem) or
+`s3_uri` (S3 bucket - see [S3 Mode](#s3-mode) below). The connector
+creates three subdirectories (or S3 key prefixes) under the
+destination:
 
 ```
-{output_dir}/state/        — current.json + last_checkpoint.json
-{output_dir}/ddl-cache/    — schema cache (gzipped JSON, content-addressable)
-{output_dir}/data/         — parquet output files
+<dest>/state/        - current.json + last_checkpoint.json
+<dest>/ddl-cache/    - schema cache (gzipped JSON, content-addressable)
+<dest>/data/         - parquet output files
 ```
+
+### S3 Mode
+
+Set `s3_uri` instead of `output_dir` to write directly to S3:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 3306,
+  "user": "repl_user",
+  "password": "password",
+  "database": "mydb",
+  "from_binlog_file": "binlog.000002",
+  "from_binlog_position": 4,
+  "output_mode": "parquet",
+  "s3_uri": "s3://my-bucket/connector/dev1",
+  "parquet_batch_size": 8192
+}
+```
+
+`output_dir` and `s3_uri` are mutually exclusive (validation rejects
+both being set). When `s3_uri` is set the connector reads AWS
+credentials from the environment:
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AWS_ACCESS_KEY_ID` | yes | -- | IAM access key (static or STS-vended) |
+| `AWS_SECRET_ACCESS_KEY` | yes | -- | Matching secret |
+| `AWS_SESSION_TOKEN` | no | `null` | Required for STS-vended sessions; signed via `x-amz-security-token` request header. Lambda sets this automatically; local CLI users get it from `aws sts get-session-token` |
+| `AWS_REGION` | no | `us-east-1` | Bucket region |
+
+The IAM role / user must have `s3:PutObject`, `s3:GetObject`,
+`s3:DeleteObject`, and `s3:ListBucket` on the target bucket+prefix.
+
+The connector verifies write access at startup via a tiny
+self-deleting `.probe-{ms}` round-trip. Failures produce a
+`[OUTPUT_NOT_WRITABLE]` error with the underlying cause -
+fail-fast on permission, route, or IAM gaps instead of dying 30s
+later inside the lock claim. The same probe runs for local
+filesystem destinations too.
+
+> **Networking note:** Lambda functions in a VPC need either an
+> S3 Gateway VPC Endpoint (free, recommended) or a NAT Gateway
+> (paid) for outbound S3 access. Security groups alone don't
+> route public-IP traffic - see AWS docs for `aws ec2
+> create-vpc-endpoint`.
 
 ### Configuration Reference
 
@@ -254,9 +302,11 @@ subdirectories under it:
 | `to_binlog_position` | integer | no | `null` | Stop at this offset. Same auto-bound behavior. |
 | `bound_to_master_at_init` | boolean | no | `true` | When `to_binlog_*` is unset, query master at init and use as the run ceiling. Set to `false` for forever-streaming local CLI. No effect when `to_binlog_*` is set. |
 | `output_mode` | string | no | `"stdout"` | `"stdout"` or `"parquet"` |
-| `output_dir` | string | no (yes for parquet) | `null` | Root for state files, schema cache, and parquet output. See [State Files & Resume](#state-files--resume). |
+| `output_dir` | string | no (yes for parquet, unless `s3_uri` set) | `null` | Local filesystem root for state files, schema cache, and parquet output. Mutually exclusive with `s3_uri`. See [State Files & Resume](#state-files--resume). |
+| `s3_uri` | string | no | `null` | S3 destination URI of form `s3://bucket[/prefix]`. When set, the connector uses S3 instead of local FS. AWS credentials read from env (see [S3 Mode](#s3-mode)). Mutually exclusive with `output_dir`. |
 | `parquet_batch_size` | integer | no | `8192` | Rows per Parquet batch / row group |
 | `current_state_staleness_ms` | integer | no | `90000` | Lock-staleness threshold for `current.json`. Older than this is presumed-crashed. |
+| `soft_deadline_ms` | integer | no | `90000` | Soft deadline (graceful shutdown). When set >0, the connector winds down at the next event boundary after this many ms - flushing the pending batch, writing the final checkpoint, releasing the lock. `0` (or negative) disables the gate, useful for forever-streaming local CLI. Lambda sets it at init from `lambda_ctx.deadline_ms - safety_margin`. |
 | `schema_cache_ttl_seconds` | integer | no | `null` | Optional staleness gate for the cached schemas. `null` disables the check (any non-empty cache is trusted). |
 | `include` | string[] | no | `null` | Table filter include patterns (see [Table Filtering](#table-filtering)) |
 | `exclude` | string[] | no | `null` | Table filter exclude patterns (see [Table Filtering](#table-filtering)) |
@@ -271,7 +321,9 @@ subdirectories under it:
 - `port` must be greater than 0
 - `from_binlog_file` and `from_binlog_position` must be set together (or both omitted)
 - When set, `from_binlog_position` must be >= 4 (binlog header size)
-- `output_mode = "parquet"` requires `output_dir`
+- `output_mode = "parquet"` requires `output_dir` OR `s3_uri`
+- `output_dir` and `s3_uri` are mutually exclusive (set exactly one)
+- `s3_uri` must parse as `s3://bucket[/prefix]` with bucket length 3..63
 - If `to_binlog_file` is specified and matches `from_binlog_file`, then `to_binlog_position` must be greater than `from_binlog_position`
 - Filter patterns must contain exactly one `.` and match one of: `schema.table`, `schema.*`, `*.table`
 - The same pattern cannot appear in both `include` and `exclude` (startup error)
@@ -279,15 +331,15 @@ subdirectories under it:
 
 ## State Files & Resume
 
-When `output_dir` is set, the connector persists two state files under
-`{output_dir}/state/`:
+When `output_dir` or `s3_uri` is set, the connector persists two state
+files under `<dest>/state/` (local path or S3 key prefix):
 
-- **`current.json`** — the lock. Written at startup when the connector
+- **`current.json`** - the lock. Written at startup when the connector
   claims ownership; deleted on clean shutdown. A run finding a
   recently-written `current.json` (younger than
   `current_state_staleness_ms`, default 90s) exits gracefully without
   doing any work, assuming a concurrent owner is active.
-- **`last_checkpoint.json`** — the durable resume point. Written once
+- **`last_checkpoint.json`** - the durable resume point. Written once
   on clean shutdown with the final binlog `{file, position}` and the
   schema cache key. Subsequent runs read this and resume from the
   recorded position.
@@ -301,29 +353,35 @@ At startup, the connector resolves its start position via this chain
    ignored at this point.)
 2. **`from_binlog_*` config**, if both fields are set.
 3. **Master query** (`SHOW BINARY LOG STATUS`, falling back to
-   `SHOW MASTER STATUS`) — bootstrap-of-last-resort.
+   `SHOW MASTER STATUS`) - bootstrap-of-last-resort.
 
 If all three fail, the connector exits with a `[MISSING_START_POSITION]`
 error listing what was tried.
 
 ### Footgun: config `from_binlog_*` is ignored once a checkpoint exists
 
-This is intentional — it's how resume works. The genesis `from_binlog_*`
+This is intentional - it's how resume works. The genesis `from_binlog_*`
 values in your config are used **once**, on the first run before any
 checkpoint exists. After that, the checkpoint is the source of truth.
 
 > **To force a fresh start from the config genesis:**
 >
 > ```sh
+> # Local FS:
 > rm {output_dir}/state/last_checkpoint.json
 > # Optionally also: rm {output_dir}/state/current.json
+>
+> # S3:
+> aws s3 rm s3://{bucket}/{prefix}/state/last_checkpoint.json
+> # Optionally also: aws s3 rm s3://{bucket}/{prefix}/state/current.json
 > ```
 >
 > Then re-run. The connector will see no checkpoint, fall through to
 > config (or master query), and start from there.
 
 This is *not* "compare config A vs checkpoint B and pick the newer one"
-— that would silently widen the data window in surprising ways. The
+
+- that would silently widen the data window in surprising ways. The
 checkpoint always wins; explicit deletion is the user-facing override.
 
 ### Crash recovery
@@ -333,13 +391,13 @@ On any error path during a run, the connector deliberately leaves
 run sees a stale lock (older than `current_state_staleness_ms`), logs a
 `found stale state, assuming crashed predecessor` warning, and resumes
 from the last successful `last_checkpoint.json`. Visible/loud failure
-is a feature — repeated stale-lock warnings on alerting dashboards are
+is a feature - repeated stale-lock warnings on alerting dashboards are
 the operator's signal that runs aren't completing cleanly.
 
 ### Auto-bounded runs (`bound_to_master_at_init`)
 
 By default, when `to_binlog_*` is not set in config, the connector
-queries master position at init and uses it as the run ceiling — i.e.
+queries master position at init and uses it as the run ceiling - i.e.
 "catch up to where master was when we started, then exit cleanly." This
 matches the Lambda invocation model and hedges against accidental
 concurrent runs (a stale-lock-misread-as-crashed scenario only ever
@@ -473,6 +531,14 @@ zig build run -- config.json
 | `--log-file <path>` | Write logs to file instead of stderr (overrides config `log_file`) |
 
 CLI flags take precedence over JSON config values. When no `--log-file` is specified, logs are written to stderr with colored output using Zig's built-in terminal formatting.
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `CONFIG_PATH` | Path to the JSON config file. Overrides the positional CLI arg when both are set. Used by the Lambda invocation path where there are no CLI args. |
+
+Per-field env-var overrides for individual config keys are intentionally not supported. For dynamic Lambda configuration, the adapter layer pulls config from SSM (see `plans/03-aws-lambda-zig.md`) and writes a JSON file the connector reads via `CONFIG_PATH`.
 
 ### Logging
 

@@ -19,6 +19,10 @@
             .url = "git+https://github.com/Shimongb/myzqlparser.git#267521c65fa0b67c06638103ca8f9f205d321e66",
             .hash = "myzqlparser-0.0.0-lIB8H7_aCQD6DpcKOlSCtsPNL_EtBNrs_AZAA6yAFp0j",
         },
+        .z3 = .{
+            .url = "git+https://codeberg.org/fellowtraveler/z3.git#6170f82ac8dbc377167adc818b2ec45b0cd30b9c",
+            .hash = "z3-0.4.0-N25-cCCMAQAJwdfivwRrCFccaGnnVPk7TnWKn4S7U-5a",
+        },
     },
     .paths = .{
         "build.zig",
