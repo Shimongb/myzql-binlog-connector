@@ -15,7 +15,11 @@ pub const prereq_check = @import("prereq_check.zig");
 pub const object_store = @import("object_store.zig");
 pub const state = @import("state.zig");
 pub const config = @import("config.zig");
+pub const aws_creds = @import("aws_creds.zig");
+pub const aws_sigv4 = @import("aws_sigv4.zig");
+pub const clock = @import("clock.zig");
 pub const s3_store = @import("s3_store.zig");
+pub const ssm_client = @import("ssm_client.zig");
 
 test "root module" {
     // Placeholder test
@@ -31,5 +35,9 @@ comptime {
     _ = object_store;
     _ = state;
     _ = config;
+    _ = aws_creds;
+    _ = aws_sigv4;
+    _ = clock;
     _ = s3_store;
+    _ = ssm_client;
 }

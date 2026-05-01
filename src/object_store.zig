@@ -30,26 +30,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const s3_store = @import("s3_store.zig");
+const clock = @import("clock.zig");
 
 const log = std.log.scoped(.object_store);
-
-/// Wall-clock time in nanoseconds. `std.time.nanoTimestamp` is not part of
-/// the 0.16 stdlib; mirror `metrics.nanoTimestamp` to stay self-contained.
-fn currentNanos() i128 {
-    if (comptime builtin.os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-    } else {
-        var ts: posix.system.timespec = undefined;
-        if (posix.system.clock_gettime(.REALTIME, &ts) != 0) return 0;
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-    }
-}
-
-fn currentMillis() i64 {
-    return @intCast(@divTrunc(currentNanos(), std.time.ns_per_ms));
-}
 
 /// Canonical error set. Narrow on purpose - callers want "did it work"
 /// first and "why" second; mapping POSIX errno and S3 HTTP status families
@@ -171,7 +154,7 @@ pub const ObjectStore = union(enum) {
         const probe_key = std.fmt.bufPrint(
             &key_buf,
             ".probe-{d}",
-            .{currentMillis()},
+            .{clock.nowMs()},
         ) catch return Error.Io;
 
         var h = try self.create(probe_key);
@@ -218,7 +201,7 @@ pub const PosixStore = struct {
         const temp_path = std.fmt.allocPrint(
             self.allocator,
             "{s}.{d}.{d}.tmp",
-            .{ final_path, pid, currentNanos() },
+            .{ final_path, pid, clock.nanoTimestamp() },
         ) catch return Error.OutOfMemory;
         errdefer self.allocator.free(temp_path);
 
@@ -604,7 +587,7 @@ test "PosixStore: head returns size and mtime" {
     const info = try store.head("meta.bin");
     try std.testing.expectEqual(@as(u64, payload.len), info.size);
     // mtime_ms should be within a reasonable window of now.
-    const now_ms = currentMillis();
+    const now_ms = clock.nowMs();
     try std.testing.expect(info.last_modified_ms > now_ms - 60_000);
     try std.testing.expect(info.last_modified_ms <= now_ms + 60_000);
 }

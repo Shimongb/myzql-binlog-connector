@@ -60,9 +60,8 @@ pub const DATA_SUBDIR = "data";
 pub const DEFAULT_CURRENT_STATE_STALENESS_MS: i64 = 90_000;
 
 /// Default flush-size gate.
-/// default. Above this many buffered binlog bytes (summed from event
-/// header `event_size`), the parquet writer flushes and starts a new
-/// file.
+/// Above this many buffered binlog bytes (summed from event
+/// header `event_size`), the parquet writer flushes and starts a new file.
 pub const DEFAULT_FLUSH_SIZE_BYTES: u64 = 100 * 1024 * 1024; // 100MB
 
 /// Lower bound for `flush_size_bytes` - prevents excessive flush
@@ -275,7 +274,8 @@ pub const Config = struct {
     /// Time gate. Flushes a non-empty buffer after this many ms of
     /// inactivity. Doesn't fire on an empty buffer.
     flush_time_gate_ms: i64 = DEFAULT_FLUSH_TIME_GATE_MS,
-    /// Soft deadline
+    /// Soft deadline (wired once Lambda invocation timeouts matter).
+    /// Declared now so configs are forward-compatible.
     soft_deadline_ms: i64 = DEFAULT_SOFT_DEADLINE_MS,
 
     // === SSL/TLS Settings ===

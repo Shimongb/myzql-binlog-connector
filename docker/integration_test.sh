@@ -622,6 +622,59 @@ EOF
   S3_SMOKE_RAN=true
 fi
 
+# ----------------------------------------------------------------
+# OPTIONAL run_ssm: live SSM GetParametersByPath roundtrip.
+#
+# Same env-var gate as run_s3 (AWS_ACCESS_KEY_ID must be set -
+# typically via `source ~/.myzql-binlog-aws.env`). Reads SSM
+# parameters under the connector's conventional dev prefix, asserts
+# the four expected keys (host/port/user/password) are present and
+# decrypted. password is a SecureString - we assert non-empty
+# decrypted length without printing the value.
+#
+# AWS-side state required (one-time setup, IAM-managed, not by this
+# script): four parameters under
+# `/config/myzql-binlog-connector/dev/db/{host,port,user,password}`.
+# ----------------------------------------------------------------
+
+SSM_SMOKE_RAN=false
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  echo "==> SKIP: AWS_ACCESS_KEY_ID not in env; SSM smoke skipped"
+else
+  SSM_PREFIX="${SSM_PARAMETER_PREFIX:-/config/myzql-binlog-connector/dev/}"
+  echo "==> Running SSM smoke at prefix=${SSM_PREFIX} ..."
+
+  SSM_OUT="$TMPDIR/ssm_smoke.out"
+  SSM_PARAMETER_PREFIX="$SSM_PREFIX" "$REPO_DIR/zig-out/bin/ssm_smoke" >"$SSM_OUT" 2>&1 || {
+    echo "SSM smoke run exited non-zero; tail:" >&2
+    tail -40 "$SSM_OUT" >&2
+    fail "SSM smoke run failed"
+  }
+
+  # Assertions: each expected leaf shows up exactly once with non-empty value.
+  for leaf in db/host db/port db/user db/password; do
+    line=$(grep "\"name\":\"${SSM_PREFIX}${leaf}\"" "$SSM_OUT" || true)
+    [ -n "$line" ] || {
+      cat "$SSM_OUT" >&2
+      fail "SSM param ${leaf} missing in smoke output"
+    }
+    # value_len must be > 0 (decryption succeeded for SecureString)
+    vlen=$(echo "$line" | sed -n 's/.*"value_len":\([0-9]*\).*/\1/p')
+    [ -n "$vlen" ] && [ "$vlen" -gt 0 ] || {
+      cat "$SSM_OUT" >&2
+      fail "SSM param ${leaf} has zero-length value (decryption failed?)"
+    }
+  done
+
+  # password specifically must be SecureString (regression guard against
+  # the param being inadvertently changed to a plain String).
+  pw_type=$(grep "\"name\":\"${SSM_PREFIX}db/password\"" "$SSM_OUT" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+  [ "$pw_type" = "SecureString" ] || fail "SSM param db/password expected SecureString, got '${pw_type}'"
+
+  echo "==> SSM smoke OK: 4 params, password decrypted (SecureString)"
+  SSM_SMOKE_RAN=true
+fi
+
 echo ""
 echo "==============================================="
 echo "  Integration test PASSED"
@@ -632,5 +685,9 @@ echo "  output_dir (state+cache+data): $OUTPUT_DIR"
 if [ "$S3_SMOKE_RAN" = "true" ]; then
   echo "  s3 smoke artifacts (kept):     ${S3_URI}/"
   echo "  s3 smoke run log:              $RUN_S3"
+fi
+if [ "$SSM_SMOKE_RAN" = "true" ]; then
+  echo "  ssm smoke prefix:              ${SSM_PREFIX}"
+  echo "  ssm smoke output:              $SSM_OUT"
 fi
 echo "==============================================="
