@@ -37,6 +37,8 @@ const log_config = @import("log_config.zig");
 const prereq_check = @import("prereq_check.zig");
 const object_store = @import("object_store.zig");
 const s3_store = @import("s3_store.zig");
+const aws_creds = @import("aws_creds.zig");
+const clock = @import("clock.zig");
 const state_mod = @import("state.zig");
 
 const schema_cache_mod = @import("schema_cache.zig");
@@ -46,12 +48,6 @@ const log = std.log.scoped(.main);
 
 const CURRENT_KEY = "current.json";
 const CHECKPOINT_KEY = "last_checkpoint.json";
-
-/// Current Unix milliseconds via the project's std.Io clock.
-fn nowMs(io: std.Io) i64 {
-    const ts = std.Io.Clock.now(.real, io);
-    return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
-}
 
 /// Compose `{user_prefix}/{subdir}` for an S3 key prefix. When the
 /// user supplied no prefix in the s3_uri, returns just the subdir
@@ -278,38 +274,17 @@ pub fn main(init: std.process.Init) !void {
         };
         const bucket_owned = try allocator.dupe(u8, parsed.bucket);
 
-        const env_map = init.environ_map;
-        const access_id = env_map.get("AWS_ACCESS_KEY_ID") orelse {
-            log.err(
-                "[MISSING_AWS_CREDS] AWS_ACCESS_KEY_ID env var is required when config.s3_uri is set",
-                .{},
-            );
-            return error.MissingAwsCredentials;
-        };
-        const secret = env_map.get("AWS_SECRET_ACCESS_KEY") orelse {
-            log.err(
-                "[MISSING_AWS_CREDS] AWS_SECRET_ACCESS_KEY env var is required when config.s3_uri is set",
-                .{},
-            );
-            return error.MissingAwsCredentials;
-        };
-        const session_token = env_map.get("AWS_SESSION_TOKEN");
-        const region = env_map.get("AWS_REGION") orelse "us-east-1";
+        // Creds borrows from `init.environ_map`, which lives for the
+        // whole process - safe to hold the borrowed slices in every
+        // S3Store. fromEnv logs a clear `[MISSING_AWS_CREDS]` line and
+        // returns an error if AWS_ACCESS_KEY_ID/_SECRET aren't set.
+        const creds = try aws_creds.fromEnv(init.environ_map);
 
         // Build prefix strings: `{user_prefix}/{subdir}` (or just `{subdir}`
         // if user_prefix is empty).
         const state_prefix = try composePrefix(allocator, parsed.prefix, config_mod.STATE_SUBDIR);
         const cache_prefix = try composePrefix(allocator, parsed.prefix, config_mod.DDL_CACHE_SUBDIR);
         const data_prefix = try composePrefix(allocator, parsed.prefix, config_mod.DATA_SUBDIR);
-
-        // Creds struct lives inside each S3Store via copy; its strings
-        // are env-owned and stay alive for the whole process.
-        const creds: s3_store.Creds = .{
-            .access_key_id = access_id,
-            .secret_access_key = secret,
-            .session_token = session_token,
-            .region = region,
-        };
 
         threaded_io = std.Io.Threaded.init(gpa.allocator(), .{ .environ = init.minimal.environ });
         threaded_io_initialized = true;
@@ -365,7 +340,7 @@ pub fn main(init: std.process.Init) !void {
             store,
             CURRENT_KEY,
             config.current_state_staleness_ms,
-            nowMs(init.io),
+            clock.nowMs(),
         ) catch |err| {
             log.err("state checkLock failed: {}", .{err});
             return err;
@@ -376,7 +351,7 @@ pub fn main(init: std.process.Init) !void {
             .acquired_fresh => log.info("no prior state - fresh execution", .{}),
             .acquired_stale_predecessor => {
                 if (lock_check.prior_state) |s| {
-                    const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
+                    const age_s = @divFloor(clock.nowMs() - s.updated_at_ms, std.time.ms_per_s);
                     log.warn(
                         "found stale state (run_id: {s}, age: {d}s); assuming crashed predecessor - will resume from checkpoint",
                         .{ s.run_id, age_s },
@@ -387,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
             },
             .skip_live_owner => {
                 if (lock_check.prior_state) |s| {
-                    const age_s = @divFloor(nowMs(init.io) - s.updated_at_ms, std.time.ms_per_s);
+                    const age_s = @divFloor(clock.nowMs() - s.updated_at_ms, std.time.ms_per_s);
                     log.warn(
                         "found recent in-progress state (run_id: {s}, age: {d}s) - skipping execution to avoid duplication",
                         .{ s.run_id, age_s },
@@ -457,7 +432,9 @@ pub fn main(init: std.process.Init) !void {
     // Auto-bound the run with master pos as the ceiling, when:
     //   * `bound_to_master_at_init` is true (default), AND
     //   * neither `to_binlog_file` nor `to_binlog_position` is set in config.
-    // Hedges against accidental concurrent runs (a stale-lock-misread-as-crashed scenario only re-replays the already-captured range)
+    // Hedges against accidental concurrent runs (a stale-lock-misread-as-
+    // crashed scenario only re-replays the already-captured range), and
+    // matches the Lambda-shape "catch up then exit" model.
     if (config.bound_to_master_at_init and config.to_binlog_file == null and config.to_binlog_position == null) {
         const ceiling = prereq_check.getMasterPosition(allocator, &conn) catch |err| blk: {
             log.warn("bound_to_master_at_init: master query failed ({}); leaving run unbounded", .{err});
@@ -482,7 +459,7 @@ pub fn main(init: std.process.Init) !void {
         const lock_state: state_mod.BinlogState = .{
             .binlog_file = prereq.file,
             .binlog_position = prereq.position,
-            .updated_at_ms = nowMs(init.io),
+            .updated_at_ms = clock.nowMs(),
             .run_id = id,
             // Carry the predecessor's cache key forward - if we crash
             // before writing a new cache, the next run still has a key.
@@ -533,7 +510,7 @@ pub fn main(init: std.process.Init) !void {
                 var skip_load = false;
                 if (config.schema_cache_ttl_seconds) |ttl| {
                     if (store.head(key)) |info| {
-                        const now_secs = @divFloor(nowMs(init.io), std.time.ms_per_s);
+                        const now_secs = @divFloor(clock.nowMs(), std.time.ms_per_s);
                         const mtime = @divFloor(info.last_modified_ms, std.time.ms_per_s);
                         if (cache_persistence.isStaleByTtl(mtime, now_secs, ttl)) {
                             log.warn(
@@ -735,7 +712,7 @@ pub fn main(init: std.process.Init) !void {
         const final_state: state_mod.BinlogState = .{
             .binlog_file = reader.current_binlog_file,
             .binlog_position = reader.current_position,
-            .updated_at_ms = nowMs(init.io),
+            .updated_at_ms = clock.nowMs(),
             .run_id = run_id.?,
             .schema_cache_key = saved_cache_key,
             .is_in_progress = false,

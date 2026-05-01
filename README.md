@@ -538,7 +538,7 @@ CLI flags take precedence over JSON config values. When no `--log-file` is speci
 |----------|-------------|
 | `CONFIG_PATH` | Path to the JSON config file. Overrides the positional CLI arg when both are set. Used by the Lambda invocation path where there are no CLI args. |
 
-Per-field env-var overrides for individual config keys are intentionally not supported. For dynamic Lambda configuration, the adapter layer pulls config from SSM (see `plans/03-aws-lambda-zig.md`) and writes a JSON file the connector reads via `CONFIG_PATH`.
+Per-field env-var overrides for individual config keys are intentionally not supported. For dynamic Lambda configuration, the adapter layer pulls config from SSM and writes a JSON file the connector reads via `CONFIG_PATH`.
 
 ### Logging
 

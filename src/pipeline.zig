@@ -18,6 +18,7 @@ const RowJsonSerializer = @import("row_json_serializer.zig").RowJsonSerializer;
 const event_parser = @import("event_parser.zig");
 const metrics = @import("metrics.zig");
 const PipelineMetrics = metrics.PipelineMetrics;
+const clock = @import("clock.zig");
 const schema_cache_mod = @import("schema_cache.zig");
 const ColumnInfo = schema_cache_mod.ColumnInfo;
 const config_mod = @import("config.zig");
@@ -25,15 +26,6 @@ const BooleanEncoding = config_mod.BooleanEncoding;
 const state_mod = @import("state.zig");
 
 const log = std.log.scoped(.pipeline);
-
-/// Current Unix milliseconds. Local helper so pipeline doesn't need an
-/// `Io` plumbed through - the time gate's correctness only requires
-/// monotonic-ish forward progress, not strict semantics. Reuses the
-/// project's `metrics.nanoTimestamp` helper (which routes to a
-/// libc-free clock_gettime on Linux, libc on macOS).
-fn nowMs() i64 {
-    return @intCast(@divFloor(metrics.nanoTimestamp(), std.time.ns_per_ms));
-}
 
 /// Sleep for `ns` nanoseconds via std.posix.system.nanosleep - routes
 /// to the Linux syscall (no libc) and to macOS libc, matching the
@@ -340,10 +332,10 @@ pub const Pipeline = struct {
             .data_label = try allocator.dupe(u8, opts.data_label),
             .initial_binlog_file = try allocator.dupe(u8, opts.initial_binlog_file),
             .bytes_since_boundary = 0,
-            .last_boundary_ms = nowMs(),
+            .last_boundary_ms = clock.nowMs(),
             .flush_size_bytes = opts.flush_size_bytes,
             .flush_time_gate_ms = opts.flush_time_gate_ms,
-            .start_ms = nowMs(),
+            .start_ms = clock.nowMs(),
             .soft_deadline_ms = opts.soft_deadline_ms,
             .deadline_fired = std.atomic.Value(bool).init(false),
             .state_store = opts.state_store,
@@ -437,7 +429,7 @@ pub const Pipeline = struct {
             // Fires once: subsequent ticks are no-ops because `deadline_fired` is sticky.
             // Producers see the signal via `shouldStop()` and wind down at the next event boundary.
             if (self.soft_deadline_ms > 0 and !self.deadline_fired.load(.acquire)) {
-                const elapsed = nowMs() - self.start_ms;
+                const elapsed = clock.nowMs() - self.start_ms;
                 if (elapsed >= self.soft_deadline_ms) {
                     log.info(
                         "soft deadline reached after {d}ms (configured {d}ms); requesting graceful shutdown",
@@ -574,7 +566,7 @@ pub const Pipeline = struct {
                     // longer than the configured threshold. Doesn't fire
                     // on an empty buffer (no events to lose).
                     if (self.bytes_since_boundary == 0) continue;
-                    const elapsed_ms = nowMs() - self.last_boundary_ms;
+                    const elapsed_ms = clock.nowMs() - self.last_boundary_ms;
                     if (elapsed_ms < self.flush_time_gate_ms) continue;
                     log.info(
                         "time gate fired: {d}ms since last boundary >= {d}ms",
@@ -650,7 +642,7 @@ pub const Pipeline = struct {
         };
 
         self.bytes_since_boundary = 0;
-        self.last_boundary_ms = nowMs();
+        self.last_boundary_ms = clock.nowMs();
     }
 
     /// Per-file state tracked by the flush worker between boundaries.
@@ -790,7 +782,7 @@ pub const Pipeline = struct {
     fn openFile(self: *Pipeline, fs: *FileState, current_binlog_file: []const u8) !void {
         std.debug.assert(fs.pw == null);
 
-        const uuid = try state_mod.generateUuidV7(self.allocator, nowMs());
+        const uuid = try state_mod.generateUuidV7(self.allocator, clock.nowMs());
         errdefer self.allocator.free(uuid);
 
         // Placeholder key: a leading dot keeps it out of the
@@ -906,7 +898,7 @@ pub const Pipeline = struct {
         const checkpoint: state_mod.BinlogState = .{
             .binlog_file = file,
             .binlog_position = pos,
-            .updated_at_ms = nowMs(),
+            .updated_at_ms = clock.nowMs(),
             .run_id = self.run_id,
             // Pipeline only knows the predecessor's cache key; main
             // writes the new key in the post-shutdown final checkpoint.

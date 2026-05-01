@@ -1,4 +1,4 @@
-//! S3 backend for `ObjectStore` (plans/02 Step 2 - `feat/s3-store`).
+//! S3 backend for `ObjectStore`.
 //!
 //! Wraps z3's `S3Client` with three responsibilities our use cases
 //! demand and z3 doesn't provide on its own:
@@ -9,10 +9,9 @@
 //!    signer signs whatever's in the array (s3_signing.zig:11-94).
 //!
 //! 2. **Mandatory status check** after every z3 raw-response op
-//!    (`putObject`, `headObject`, `deleteObject`, `getObject`). All
-//!    four skip the status check internally - they hand back the
-//!    Response on any HTTP code, including 4xx/5xx. We caught this
-//!    with a Lambda smoke on 2026-04-28 (see plans/02-z3.md).
+//!    (`putObject`, `headObject`, `deleteObject`, `getObject`).
+//!    All four skip the status check internally
+//!    they hand back the Response on any HTTP code, including 4xx/5xx.
 //!
 //! 3. **Buffer-then-put writes**. `WriteHandle.write` appends to an
 //!    in-memory ArrayList; `commit` (or `commitAs`) issues a single
@@ -25,6 +24,7 @@
 const std = @import("std");
 const s3 = @import("s3");
 const object_store = @import("object_store.zig");
+const aws_creds = @import("aws_creds.zig");
 
 const log = std.log.scoped(.s3_store);
 
@@ -40,15 +40,10 @@ pub const HeadInfo = object_store.HeadInfo;
 // `Last-Modified` header. 0 on parse failure is safe - the
 // connector's `isStaleByTtl` treats 0 as "always stale".
 
-pub const Creds = struct {
-    access_key_id: []const u8,
-    secret_access_key: []const u8,
-    /// STS-vended sessions provide this; static IAM users don't.
-    /// When non-null, every op signs `x-amz-security-token` via
-    /// `RequestOptions.custom_header`.
-    session_token: ?[]const u8 = null,
-    region: []const u8,
-};
+/// Re-export so existing callers (`main.zig` etc.) can still write
+/// `s3_store.Creds`. The struct itself lives in `aws_creds.zig`
+/// since SSM and any future AWS client share the same shape.
+pub const Creds = aws_creds.Creds;
 
 pub const S3Store = struct {
     allocator: std.mem.Allocator,

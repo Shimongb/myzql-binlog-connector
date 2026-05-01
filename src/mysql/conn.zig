@@ -377,11 +377,11 @@ pub const Conn = struct {
             return error.TlsHandshakeFailed;
         };
 
-        // Build the cleartext Reader/Writer over the Connection.
+        // Step 6: Build the cleartext Reader/Writer over the Connection.
         handles.reader = handles.conn.reader(tls_app_read_buf);
         handles.writer = handles.conn.writer(tls_app_write_buf);
 
-        // step 7: Switch stream to use TLS (point at the Io.Reader/Writer
+        // Step 7: Switch stream to use TLS (point at the Io.Reader/Writer
         // interfaces that ianic's Reader/Writer expose).
         conn.stream.tls_reader = &handles.reader.interface;
         conn.stream.tls_writer = &handles.writer.interface;

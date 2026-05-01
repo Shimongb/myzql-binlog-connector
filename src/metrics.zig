@@ -3,24 +3,14 @@
 //! Tracks timing and throughput for the parquet pipeline workers.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const posix = std.posix;
+const clock = @import("clock.zig");
 
 const log = std.log.scoped(.metrics);
 
-/// Get current wall-clock time in nanoseconds.
-/// Uses clock_gettime via posix.system (routes to libc on macOS, direct syscalls on Linux).
-pub fn nanoTimestamp() i128 {
-    if (comptime builtin.os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-    } else {
-        var ts: posix.system.timespec = undefined;
-        if (posix.system.clock_gettime(.REALTIME, &ts) != 0) return 0;
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-    }
-}
+/// Re-export from `clock.zig` so existing `metrics.nanoTimestamp(...)`
+/// call sites keep working without churn. New callers should import
+/// `clock` directly.
+pub const nanoTimestamp = clock.nanoTimestamp;
 
 pub const PipelineMetrics = struct {
     start_ns: i128 = 0,

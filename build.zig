@@ -74,6 +74,26 @@ pub fn build(b: *std.Build) void {
     // Install the executable to zig-out/bin/
     b.installArtifact(exe);
 
+    // === SSM SMOKE BINARY ===
+    // Tiny exe that calls getParametersByPath and prints results
+    // used by docker/integration_test.sh's `run_ssm` step.
+    // Lives here so `zig build` produces both `myzql_binlog_connector` and `ssm_smoke` side-by-side
+    // without needing a separate `zig build ssm-smoke` invocation.
+    const ssm_smoke = b.addExecutable(.{
+        .name = "ssm_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ssm_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = needs_libc,
+            .imports = &.{
+                .{ .name = "myzql_binlog_connector", .module = mod },
+                .{ .name = "tls", .module = tls_mod },
+            },
+        }),
+    });
+    b.installArtifact(ssm_smoke);
+
     // === RUN STEP ===
     // `zig build run -- config.json`
     const run_step = b.step("run", "Run the binlog connector");
