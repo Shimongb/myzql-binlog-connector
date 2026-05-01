@@ -24,6 +24,21 @@ pub fn build(b: *std.Build) void {
     // On Linux, we use direct syscalls via std.os.linux - no libc needed.
     const needs_libc = target.result.os.tag.isDarwin();
 
+    // === LAMBDA BUILD SWITCH ===
+    // `-Dlambda=true` adds the `bootstrap` exe target (the AWS Lambda
+    // handler binary). Off by default - local builds don't compile
+    // aws-lambda-zig source unless explicitly requested.
+    //
+    // For deploy: `zig build -Dlambda=true -Dtarget=aarch64-linux-gnu \
+    //              -Doptimize=ReleaseSafe`
+    // Output: `zig-out/bin/bootstrap` (Lambda's `provided.al2023`
+    //         runtime requires the binary at zip root named `bootstrap`).
+    const build_lambda = b.option(
+        bool,
+        "lambda",
+        "Build the Lambda bootstrap exe (default: false)",
+    ) orelse false;
+
     // === SQL PARSER DEPENDENCY ===
     const myzqlparser_dep = b.dependency("myzqlparser", .{ .target = target });
     const myzqlparser_mod = myzqlparser_dep.module("myzqlparser");
@@ -39,6 +54,15 @@ pub fn build(b: *std.Build) void {
     // Async S3 client built on std.http.Client + std.Io.
     const z3_dep = b.dependency("z3", .{ .target = target, .optimize = optimize });
     const z3_mod = z3_dep.module("s3");
+
+    // === LAMBDA RUNTIME DEPENDENCY (github.com/by-nir/aws-lambda-zig) ===
+    // Pinned via `zig fetch --save` at d9167a4 (= upstream tip "Release 0.5.0").
+    // Module name "lambda" once consumed.
+    //
+    // Declared here so build.zig and build.zig.zon stay in sync; not yet
+    // wired into any target's imports - that happens in the
+    // `-Dlambda=true bootstrap exe` step.
+    // Until then, `zig build` doesn't compile aws-lambda-zig source.
 
     // Create library module (optional - for reuse in other Zig projects)
     const mod = b.addModule("myzql_binlog_connector", .{
@@ -93,6 +117,62 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(ssm_smoke);
+
+    // === LAMBDA BOOTSTRAP EXE (gated on -Dlambda=true) ===
+    // Built when `-Dlambda=true` is set. Pull in aws-lambda-zig
+    // here (rather than at the top-level dep block) so the default
+    // build doesn't compile its source.
+    //
+    // Cross-compile invocation:
+    //   zig build -Dlambda=true -Dtarget=aarch64-linux-gnu -Doptimize=ReleaseSafe
+    //
+    // The binary MUST be named `bootstrap` for Lambda's
+    // `provided.al2023` runtime - that's the entry-point convention
+    // for OS-only / custom runtimes.
+    if (build_lambda) {
+        // aws-lambda-zig's build.zig has multiple `addModule("lambda", ...)`
+        // calls - passing `.optimize` as a dep arg trips it up
+        // ("invalid option: -Doptimize" from the dep's option-table
+        // validation). Pass target only; optimize gets inherited via
+        // the parent build's compile flags.
+        const aws_lambda_dep = b.dependency("aws_lambda", .{
+            .target = target,
+        });
+        const lambda_mod = aws_lambda_dep.module("lambda");
+
+        const bootstrap = b.addExecutable(.{
+            .name = "bootstrap",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lambda_handler.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = needs_libc,
+                .imports = &.{
+                    .{ .name = "myzql_binlog_connector", .module = mod },
+                    .{ .name = "myzqlparser", .module = myzqlparser_mod },
+                    .{ .name = "tls", .module = tls_mod },
+                    .{ .name = "s3", .module = z3_mod },
+                    .{ .name = "lambda", .module = lambda_mod },
+                },
+            }),
+        });
+        b.installArtifact(bootstrap);
+
+        // === LAMBDA-ZIP STEP ===
+        // `zig build lambda-zip` → `zig-out/lambda.zip` ready for
+        // `aws lambda update-function-code --zip-file fileb://...`.
+        // Uses `-j` (junk paths) so `bootstrap` lands at the zip root,
+        // not under `bin/` - Lambda's runtime looks for it there.
+        const zip_cmd = b.addSystemCommand(&.{
+            "zip", "-q", "-j",
+        });
+        zip_cmd.addFileArg(b.path("zig-out/lambda.zip"));
+        zip_cmd.addArtifactArg(bootstrap);
+        zip_cmd.step.dependOn(b.getInstallStep());
+
+        const zip_step = b.step("lambda-zip", "Package the bootstrap exe into zig-out/lambda.zip for AWS Lambda deploy");
+        zip_step.dependOn(&zip_cmd.step);
+    }
 
     // === RUN STEP ===
     // `zig build run -- config.json`

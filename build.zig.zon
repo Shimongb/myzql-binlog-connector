@@ -23,6 +23,10 @@
             .url = "git+https://codeberg.org/fellowtraveler/z3.git#6170f82ac8dbc377167adc818b2ec45b0cd30b9c",
             .hash = "z3-0.4.0-N25-cCCMAQAJwdfivwRrCFccaGnnVPk7TnWKn4S7U-5a",
         },
+        .aws_lambda = .{
+            .url = "git+https://github.com/by-nir/aws-lambda-zig.git#d9167a499485b383f2f60016d154fd1103b92d38",
+            .hash = "aws_lambda-0.5.0-AMNpejHiAQCEARcmIvoxv0p8TpmVq0bdmG4BuGJ76m8u",
+        },
     },
     .paths = .{
         "build.zig",
