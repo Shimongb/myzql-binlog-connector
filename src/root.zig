@@ -18,6 +18,7 @@ pub const config = @import("config.zig");
 pub const aws_creds = @import("aws_creds.zig");
 pub const aws_sigv4 = @import("aws_sigv4.zig");
 pub const clock = @import("clock.zig");
+pub const log_config = @import("log_config.zig");
 pub const s3_store = @import("s3_store.zig");
 pub const ssm_client = @import("ssm_client.zig");
 
@@ -38,6 +39,7 @@ comptime {
     _ = aws_creds;
     _ = aws_sigv4;
     _ = clock;
+    _ = log_config;
     _ = s3_store;
     _ = ssm_client;
 }

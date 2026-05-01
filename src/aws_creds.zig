@@ -45,6 +45,44 @@ pub const Creds = struct {
     region: []const u8,
 };
 
+/// Build `Creds` from an aws-lambda-zig Context's `config` struct (or
+/// any struct shaped like it). The Lambda runtime calls `loadMeta`
+/// once per cold start to populate these fields from the
+/// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN /
+/// AWS_REGION env vars Lambda injects - by the time our handler
+/// runs, the Context has them.
+///
+/// Structural typing (`anytype`) keeps `aws_creds.zig` free of the
+/// `lambda` package import, so the lib module + tests don't drag in
+/// aws-lambda-zig source. Caller is expected to pass
+/// `lambda_ctx.config` (the `ConfigMeta` substruct).
+///
+/// Required fields on the input struct:
+///   - `aws_access_id: []const u8`
+///   - `aws_access_secret: []const u8`
+///   - `aws_session_token: []const u8`  (empty string treated as null)
+///   - `aws_region: []const u8`
+///
+/// aws-lambda-zig defaults empty strings rather than null - we map
+/// `aws_session_token == ""` to `session_token = null` so static
+/// IAM users (no STS) get the correct shape.
+pub fn fromContext(ctx_config: anytype) Error!Creds {
+    if (ctx_config.aws_access_id.len == 0) {
+        log.err("[MISSING_AWS_CREDS] ctx.config.aws_access_id is empty", .{});
+        return error.MissingAwsCredentials;
+    }
+    if (ctx_config.aws_access_secret.len == 0) {
+        log.err("[MISSING_AWS_CREDS] ctx.config.aws_access_secret is empty", .{});
+        return error.MissingAwsCredentials;
+    }
+    return .{
+        .access_key_id = ctx_config.aws_access_id,
+        .secret_access_key = ctx_config.aws_access_secret,
+        .session_token = if (ctx_config.aws_session_token.len > 0) ctx_config.aws_session_token else null,
+        .region = ctx_config.aws_region,
+    };
+}
+
 /// Build `Creds` from a process env map. Returns
 /// `error.MissingAwsCredentials` when `AWS_ACCESS_KEY_ID` or
 /// `AWS_SECRET_ACCESS_KEY` is unset (we treat both as required -
@@ -101,3 +139,45 @@ test "fromEnv: minimal (no session token, default region)" {
 // the missing-creds path, so we leave that to the integration test
 // (`docker/integration_test.sh` run_s3 + run_ssm fail loud and visibly
 // when env vars are absent - by design).
+
+// ============================================================
+// fromContext tests - use a fake struct shaped like aws-lambda-zig's
+// Context.config. Real Context lookup happens in lambda_handler.zig.
+// ============================================================
+
+const FakeCtxConfig = struct {
+    aws_access_id: []const u8,
+    aws_access_secret: []const u8,
+    aws_session_token: []const u8,
+    aws_region: []const u8,
+};
+
+test "fromContext: full STS-vended creds via Lambda runtime" {
+    const cfg: FakeCtxConfig = .{
+        .aws_access_id = "ASIATEST",
+        .aws_access_secret = "secret",
+        .aws_session_token = "token",
+        .aws_region = "us-west-2",
+    };
+    const c = try fromContext(cfg);
+    try std.testing.expectEqualStrings("ASIATEST", c.access_key_id);
+    try std.testing.expectEqualStrings("secret", c.secret_access_key);
+    try std.testing.expectEqualStrings("token", c.session_token.?);
+    try std.testing.expectEqualStrings("us-west-2", c.region);
+}
+
+test "fromContext: empty session_token maps to null (static IAM user)" {
+    const cfg: FakeCtxConfig = .{
+        .aws_access_id = "AKIATEST",
+        .aws_access_secret = "secret",
+        .aws_session_token = "",
+        .aws_region = "us-east-1",
+    };
+    const c = try fromContext(cfg);
+    try std.testing.expect(c.session_token == null);
+}
+
+// Negative paths (empty access_id / access_secret) skipped for the
+// same Zig 0.16 log.err-as-failure reason as fromEnv; integration
+// test surfaces the failure when the lambda runtime hands us empty
+// fields (which would itself be a Lambda misconfiguration).

@@ -28,6 +28,31 @@
 //! resume from it and ignore `from_binlog_*`. To force a restart from
 //! config, delete `{output_dir}/state/last_checkpoint.json`.
 //!
+//! === CONFIG PRECEDENCE CHAIN ===
+//!
+//! The same `Config` struct serves both the local CLI and the future
+//! Lambda handler. Fields are filled in this order (first-wins):
+//!
+//!   1. **Explicit source** - for CLI: `config.json` parsed via
+//!      `loadFromFile`. For Lambda: `event.detail` payload parsed via
+//!      `loadFromJson`. This is the per-invocation source of truth and
+//!      should carry whatever the operator means to override.
+//!   2. **Environment variables** - `mergeFromEnv` fills in any field
+//!      still at its `?T = null` default from the corresponding env var.
+//!      Env vars exist for things that are reasonable to set once per
+//!      Lambda function (or shell session) rather than per invocation:
+//!      `SSM_PARAMETER_PREFIX`, `S3_URI`, `FLUSH_BYTES_THRESHOLD`.
+//!   3. **Compile-time defaults** - the `?T = null` left at this stage
+//!      either uses the constant default (for fields with one) or stays
+//!      null where "absent" is itself meaningful (e.g. `server_name`
+//!      null means "single-tenant CLI dev mode, don't use the
+//!      <server_name> path segment").
+//!
+//! Per-lane (per-invocation) values like `server_name`, `from_binlog_*`,
+//! `to_binlog_*`, `include`/`exclude` are payload-only - they don't
+//! make sense as Lambda-function-wide env vars, so `mergeFromEnv`
+//! ignores them.
+//!
 //! === MEMORY MANAGEMENT ===
 //!
 //! The Config struct contains slices that point to memory allocated by the JSON parser.
@@ -200,8 +225,15 @@ fn extractBinlogFileNumber(filename: []const u8) ?u64 {
 /// Configuration for MySQL binlog connection and reading
 pub const Config = struct {
     // === Connection Settings ===
-    host: []const u8,
-    port: u16,
+    /// MySQL host. Defaulted to empty so payload-then-SSM precedence
+    /// works for Lambda (handler parses payload, then stamps SSM
+    /// creds via `fillDbCredsFromSsm` if `host == ""`). `validate()`
+    /// rejects empty values, so CLI users still get the same hard
+    /// error if they forget to set host.
+    host: []const u8 = "",
+    /// MySQL port. Defaulted to 0 (sentinel for "unset") for the same
+    /// reason as host. `validate()` rejects port == 0.
+    port: u16 = 0,
     user: ?[]const u8 = null,
     password: ?[]const u8 = null,
     database: ?[]const u8 = null,
@@ -222,6 +254,25 @@ pub const Config = struct {
     /// forever-streaming should set this to `false`. When `to_binlog_*`
     /// is explicitly set in config, this flag has no effect.
     bound_to_master_at_init: bool = true,
+
+    // === Multi-Lane Settings (Lambda payload + CLI optional) ===
+    /// Lane key - a stable identifier for the upstream MySQL cluster
+    /// being captured. When set, two things change:
+    ///   - SSM parameter path becomes `{ssm_parameter_prefix}/{server_name}/db/...`
+    ///     (the per-server-name segment that was deferred from
+    ///     `feat/ssm-client`). When null, falls back to
+    ///     `{ssm_parameter_prefix}/db/...` - the v1 single-tenant shape.
+    ///   - State + cache + data S3 key prefixes get a `{server_name}/`
+    ///     segment so multiple lanes in the same bucket don't stomp.
+    /// Payload-only (per-invocation). Env-var override is intentionally
+    /// not supported - env vars are Lambda-function-wide, and a
+    /// function-wide server_name would defeat the multi-lane pattern.
+    server_name: ?[]const u8 = null,
+    /// SSM Parameter Store path prefix for DB credentials.
+    /// Effective lookup: `{ssm_parameter_prefix}/[{server_name}/]db/{host,port,user,password}`.
+    /// Precedence: payload > `SSM_PARAMETER_PREFIX` env var > null
+    /// (no SSM lookup; rely on Config.{user,password,host,port}).
+    ssm_parameter_prefix: ?[]const u8 = null,
 
     // === Output Settings ===
     output_mode: OutputMode = .stdout,
@@ -349,6 +400,139 @@ pub const Config = struct {
         var clamped = parsed.value;
         clamped.applyClamps();
         return clamped;
+    }
+
+    /// Stamp DB credentials from a SSM ParamSet into this Config.
+    /// Only fills fields that are still at their unset default -
+    /// payload-supplied values win (precedence chain: explicit >
+    /// SSM > defaults).
+    ///
+    /// Looks for these suffixes (matches `Config.ssmDbPath` output):
+    ///   - `/db/host`     -> `host`     (parses as string)
+    ///   - `/db/port`     -> `port`     (parses as u16)
+    ///   - `/db/user`     -> `user`
+    ///   - `/db/password` -> `password`
+    ///
+    /// Values are duplicated using the supplied allocator since the
+    /// ParamSet may have a shorter lifetime than this Config (e.g.
+    /// the handler deinits the ParamSet right after stamping). Caller
+    /// is responsible for `allocator` outliving Config use.
+    ///
+    /// Returns `error.InvalidPort` if SSM has a port value that
+    /// doesn't parse as u16. Other parse failures are reported via
+    /// the returned error; partial state may have been stamped (the
+    /// next call to `validate()` will catch it).
+    ///
+    /// Structural typing on `params` (`anytype`) avoids forcing
+    /// `config.zig` to import `ssm_client.zig`. Caller passes a
+    /// `ssm.ParamSet` (which has `findBySuffix`); tests can pass a
+    /// fake.
+    pub fn fillDbCredsFromSsm(
+        self: *Config,
+        allocator: std.mem.Allocator,
+        params: anytype,
+    ) !void {
+        if (self.host.len == 0) {
+            if (params.findBySuffix("/db/host")) |p| {
+                self.host = try allocator.dupe(u8, p.value);
+            }
+        }
+        if (self.port == 0) {
+            if (params.findBySuffix("/db/port")) |p| {
+                self.port = std.fmt.parseInt(u16, p.value, 10) catch |err| {
+                    log.err("[BAD_SSM_PORT] /db/port='{s}' failed to parse: {}", .{ p.value, err });
+                    return ConfigError.InvalidPort;
+                };
+            }
+        }
+        if (self.user == null) {
+            if (params.findBySuffix("/db/user")) |p| {
+                self.user = try allocator.dupe(u8, p.value);
+            }
+        }
+        if (self.password == null) {
+            if (params.findBySuffix("/db/password")) |p| {
+                self.password = try allocator.dupe(u8, p.value);
+            }
+        }
+    }
+
+    /// Compose the SSM path prefix for DB credentials lookup. Returns
+    /// allocator-owned `prefix` + (optional) `server_name` segment +
+    /// trailing `/db/`. Caller frees.
+    ///
+    /// Layout:
+    ///   - server_name = null: `{ssm_parameter_prefix}/db/`
+    ///     (single-tenant shape - matches the user's deployed dev
+    ///     account at `/config/myzql-binlog-connector/dev/db/...`)
+    ///   - server_name = set:  `{ssm_parameter_prefix}/{server_name}/db/`
+    ///     (multi-lane shape - different SSM creds per upstream cluster
+    ///     under one Lambda function)
+    ///
+    /// Returns `error.MissingSsmPrefix` if `ssm_parameter_prefix` is
+    /// null - caller should validate this is set before calling, since
+    /// the path layout is meaningless without a prefix.
+    ///
+    /// Trailing slash is included so callers can append leaf names
+    /// (`host`, `port`, `user`, `password`) without managing separators.
+    pub fn ssmDbPath(self: Config, allocator: std.mem.Allocator) ![]u8 {
+        const prefix = self.ssm_parameter_prefix orelse return error.MissingSsmPrefix;
+        const trimmed = std.mem.trimEnd(u8, prefix, "/");
+        if (self.server_name) |name| {
+            return std.fmt.allocPrint(allocator, "{s}/{s}/db/", .{ trimmed, name });
+        }
+        return std.fmt.allocPrint(allocator, "{s}/db/", .{trimmed});
+    }
+
+    /// Fill in unset fields from environment variables. The precedence
+    /// chain is: explicit (payload/file) > env > defaults - so this
+    /// only mutates fields whose source value is `null`. Idempotent.
+    ///
+    /// Recognised env vars (Lambda-function-wide knobs only - per-lane
+    /// values like `server_name` stay payload-only):
+    ///   - `SSM_PARAMETER_PREFIX` -> `ssm_parameter_prefix`
+    ///   - `S3_URI`               -> `s3_uri` (must parse)
+    ///   - `OUTPUT_DIR`           -> `output_dir`
+    ///   - `FLUSH_BYTES_THRESHOLD` -> `flush_size_bytes`  (binlogdumper-compatible name)
+    ///
+    /// `FLUSH_BYTES_THRESHOLD` parse failures log a WARN and leave the
+    /// existing default in place rather than failing - bad env config
+    /// shouldn't take down the connector when a sensible default exists.
+    /// Bounds clamping for `flush_size_bytes` happens via
+    /// `applyClamps()`; call it after `mergeFromEnv` if you want the
+    /// env-supplied value clamped.
+    pub fn mergeFromEnv(self: *Config, env_map: *const std.process.Environ.Map) void {
+        if (self.ssm_parameter_prefix == null) {
+            if (env_map.get("SSM_PARAMETER_PREFIX")) |v| {
+                self.ssm_parameter_prefix = v;
+            }
+        }
+        if (self.s3_uri == null) {
+            if (env_map.get("S3_URI")) |v| {
+                self.s3_uri = v;
+            }
+        }
+        if (self.output_dir == null) {
+            if (env_map.get("OUTPUT_DIR")) |v| {
+                self.output_dir = v;
+            }
+        }
+        // Numeric: only override if the env var is set AND the field is
+        // still at its default. (We can't tell "default" vs "explicit
+        // matching default" without sentinel; treat any explicit
+        // non-default as wins.)
+        if (self.flush_size_bytes == DEFAULT_FLUSH_SIZE_BYTES) {
+            if (env_map.get("FLUSH_BYTES_THRESHOLD")) |v| {
+                if (std.fmt.parseInt(u64, v, 10)) |parsed| {
+                    self.flush_size_bytes = parsed;
+                } else |err| {
+                    log.warn(
+                        "FLUSH_BYTES_THRESHOLD='{s}' failed to parse ({}); keeping default {d}",
+                        .{ v, err, DEFAULT_FLUSH_SIZE_BYTES },
+                    );
+                }
+            }
+        }
     }
 
     /// Clamp out-of-range numeric settings to their bounds, logging a
@@ -636,4 +820,260 @@ test "parseS3Uri: rejects too-long bucket name" {
         S3UriError.BucketNameInvalid,
         parseS3Uri("s3://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
     );
+}
+
+// ============================================================
+// mergeFromEnv tests
+// ============================================================
+
+test "mergeFromEnv: fills ssm_parameter_prefix when unset" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("SSM_PARAMETER_PREFIX", "/config/svc/dev");
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqualStrings("/config/svc/dev", cfg.ssm_parameter_prefix.?);
+}
+
+test "mergeFromEnv: explicit value wins over env" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("SSM_PARAMETER_PREFIX", "/from/env");
+
+    var cfg: Config = .{
+        .host = "h",
+        .port = 3306,
+        .ssm_parameter_prefix = "/from/payload",
+    };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqualStrings("/from/payload", cfg.ssm_parameter_prefix.?);
+}
+
+test "mergeFromEnv: missing env var leaves field null" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expect(cfg.ssm_parameter_prefix == null);
+    try std.testing.expect(cfg.s3_uri == null);
+    try std.testing.expect(cfg.output_dir == null);
+}
+
+test "mergeFromEnv: S3_URI fills s3_uri" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("S3_URI", "s3://my-bucket/some/prefix");
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqualStrings("s3://my-bucket/some/prefix", cfg.s3_uri.?);
+}
+
+test "mergeFromEnv: OUTPUT_DIR fills output_dir" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("OUTPUT_DIR", "/var/lib/connector");
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqualStrings("/var/lib/connector", cfg.output_dir.?);
+}
+
+test "mergeFromEnv: FLUSH_BYTES_THRESHOLD overrides default" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("FLUSH_BYTES_THRESHOLD", "26214400"); // 25 MB (binlogdumper prod default)
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqual(@as(u64, 26_214_400), cfg.flush_size_bytes);
+}
+
+test "mergeFromEnv: explicit non-default flush_size_bytes survives env" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("FLUSH_BYTES_THRESHOLD", "26214400");
+
+    var cfg: Config = .{
+        .host = "h",
+        .port = 3306,
+        .flush_size_bytes = 50 * 1024 * 1024, // explicit
+    };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqual(@as(u64, 50 * 1024 * 1024), cfg.flush_size_bytes);
+}
+
+test "mergeFromEnv: server_name is NOT taken from env (payload-only)" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("SERVER_NAME", "leaked-from-env");
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    try std.testing.expect(cfg.server_name == null);
+}
+
+// ============================================================
+// fillDbCredsFromSsm tests - use a fake ParamSet shaped like
+// ssm_client.ParamSet (with findBySuffix). Real ParamSet lookup
+// happens in lambda_handler.zig.
+// ============================================================
+
+const FakeParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+const FakeParamSet = struct {
+    parameters: []const FakeParam,
+
+    pub fn findBySuffix(self: FakeParamSet, suffix: []const u8) ?FakeParam {
+        for (self.parameters) |p| {
+            if (std.mem.endsWith(u8, p.name, suffix)) return p;
+        }
+        return null;
+    }
+};
+
+test "fillDbCredsFromSsm: empty Config gets all four creds stamped" {
+    const params: FakeParamSet = .{ .parameters = &.{
+        .{ .name = "/p/db/host", .value = "db.example.com" },
+        .{ .name = "/p/db/port", .value = "3306" },
+        .{ .name = "/p/db/user", .value = "repl_user" },
+        .{ .name = "/p/db/password", .value = "secret" },
+    } };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{};
+    try cfg.fillDbCredsFromSsm(arena.allocator(), params);
+
+    try std.testing.expectEqualStrings("db.example.com", cfg.host);
+    try std.testing.expectEqual(@as(u16, 3306), cfg.port);
+    try std.testing.expectEqualStrings("repl_user", cfg.user.?);
+    try std.testing.expectEqualStrings("secret", cfg.password.?);
+}
+
+test "fillDbCredsFromSsm: payload-supplied host wins over SSM" {
+    const params: FakeParamSet = .{ .parameters = &.{
+        .{ .name = "/p/db/host", .value = "from-ssm" },
+    } };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{ .host = "from-payload" };
+    try cfg.fillDbCredsFromSsm(arena.allocator(), params);
+
+    try std.testing.expectEqualStrings("from-payload", cfg.host);
+}
+
+test "fillDbCredsFromSsm: payload-supplied port wins over SSM" {
+    const params: FakeParamSet = .{ .parameters = &.{
+        .{ .name = "/p/db/port", .value = "3306" },
+    } };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{ .port = 15010 };
+    try cfg.fillDbCredsFromSsm(arena.allocator(), params);
+
+    try std.testing.expectEqual(@as(u16, 15010), cfg.port);
+}
+
+test "fillDbCredsFromSsm: missing SSM params leave fields unset" {
+    const params: FakeParamSet = .{
+        .parameters = &.{
+            .{ .name = "/p/db/host", .value = "h" },
+            // user, password, port all absent
+        },
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{};
+    try cfg.fillDbCredsFromSsm(arena.allocator(), params);
+
+    try std.testing.expectEqualStrings("h", cfg.host);
+    try std.testing.expectEqual(@as(u16, 0), cfg.port);
+    try std.testing.expect(cfg.user == null);
+    try std.testing.expect(cfg.password == null);
+}
+
+test "fillDbCredsFromSsm: values are duped (ParamSet can be deinit'd)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg: Config = .{};
+
+    // Borrowed slice that we'll free to prove the dupe.
+    const ssm_value = try std.testing.allocator.dupe(u8, "transient.example");
+    defer std.testing.allocator.free(ssm_value);
+    {
+        const params: FakeParamSet = .{ .parameters = &.{
+            .{ .name = "/p/db/host", .value = ssm_value },
+        } };
+        try cfg.fillDbCredsFromSsm(arena.allocator(), params);
+    }
+    // ssm_value is still alive (deferred free) but cfg.host has its own copy.
+    try std.testing.expectEqualStrings("transient.example", cfg.host);
+    try std.testing.expect(cfg.host.ptr != ssm_value.ptr);
+}
+
+// ============================================================
+// ssmDbPath tests
+// ============================================================
+
+test "ssmDbPath: single-tenant (no server_name) - matches deployed dev shape" {
+    const cfg: Config = .{
+        .host = "h",
+        .port = 3306,
+        .ssm_parameter_prefix = "/config/myzql-binlog-connector/dev",
+    };
+    const got = try cfg.ssmDbPath(std.testing.allocator);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("/config/myzql-binlog-connector/dev/db/", got);
+}
+
+test "ssmDbPath: multi-lane (server_name set) - adds segment" {
+    const cfg: Config = .{
+        .host = "h",
+        .port = 3306,
+        .ssm_parameter_prefix = "/config/myzql-binlog-connector/prod",
+        .server_name = "app-server-a",
+    };
+    const got = try cfg.ssmDbPath(std.testing.allocator);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(
+        "/config/myzql-binlog-connector/prod/app-server-a/db/",
+        got,
+    );
+}
+
+test "ssmDbPath: trailing slash on prefix is normalized" {
+    const cfg: Config = .{
+        .host = "h",
+        .port = 3306,
+        .ssm_parameter_prefix = "/config/svc/dev/",
+    };
+    const got = try cfg.ssmDbPath(std.testing.allocator);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("/config/svc/dev/db/", got);
+}
+
+test "ssmDbPath: missing ssm_parameter_prefix is an error" {
+    const cfg: Config = .{ .host = "h", .port = 3306 };
+    try std.testing.expectError(error.MissingSsmPrefix, cfg.ssmDbPath(std.testing.allocator));
+}
+
+test "mergeFromEnv: idempotent - second call is a no-op" {
+    var em = std.process.Environ.Map.init(std.testing.allocator);
+    defer em.deinit();
+    try em.put("SSM_PARAMETER_PREFIX", "/from/env");
+
+    var cfg: Config = .{ .host = "h", .port = 3306 };
+    cfg.mergeFromEnv(&em);
+    const first = cfg.ssm_parameter_prefix.?;
+    cfg.mergeFromEnv(&em);
+    try std.testing.expectEqual(first.ptr, cfg.ssm_parameter_prefix.?.ptr);
 }
