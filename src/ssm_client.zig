@@ -110,6 +110,18 @@ pub const SsmClient = struct {
         self.http.deinit();
     }
 
+    /// Drop the embedded `std.http.Client` (including any cached TLS
+    /// session state) and spin up a fresh one. Targets the exact same
+    /// freeze/thaw failure class that `S3Store.rebuildClient` covers:
+    /// a Lambda container resumed from frozen holds onto TLS handshake
+    /// state that AWS has since expired, so the first post-thaw call
+    /// dies with `error.TlsInitializationFailed` - subsequent calls
+    /// against a fresh client succeed.
+    fn rebuildHttp(self: *SsmClient) void {
+        self.http.deinit();
+        self.http = .{ .allocator = self.allocator, .io = self.io };
+    }
+
     /// Fetch all parameters under `path`, recursively, optionally
     /// decrypting `SecureString`s. Pagination is handled transparently.
     ///
@@ -128,10 +140,32 @@ pub const SsmClient = struct {
 
         var collected: std.ArrayList(Parameter) = .empty;
         var next_token: ?[]const u8 = null;
+        var first_call = true;
 
         while (true) {
             const body = try buildRequestBody(arena_alloc, path, with_decryption, next_token);
-            const page = try self.callOnce(arena_alloc, body);
+
+            // First call of the invocation gets one retry on transport
+            // failure: post-thaw Lambda containers frequently die on
+            // `TlsInitializationFailed` before recovering on the next
+            // attempt. Scoped to the first iteration because subsequent
+            // pagination hops reuse the already-warm connection, so
+            // failures there are genuinely exceptional.
+            const page = if (first_call) blk: {
+                if (self.callOnce(arena_alloc, body)) |p| {
+                    break :blk p;
+                } else |err| {
+                    if (err != error.Io) return err;
+                    log.warn(
+                        "[SSM_RETRY] first call failed with {} - rebuilding http client and retrying once",
+                        .{err},
+                    );
+                    self.rebuildHttp();
+                    break :blk try self.callOnce(arena_alloc, body);
+                }
+            } else try self.callOnce(arena_alloc, body);
+            first_call = false;
+
             // page.params is arena-allocated; safe to retain.
             try collected.appendSlice(arena_alloc, page.parameters);
 

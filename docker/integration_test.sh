@@ -37,6 +37,17 @@ done
 
 TMPDIR=$(mktemp -d -t myzql-integration.XXXXXX)
 
+# Detect which Docker Compose variant is available.
+# Prefer the v2 plugin ("docker compose") but fall back to v1 ("docker-compose").
+if docker compose version >/dev/null 2>&1; then
+  DOCKER_COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  DOCKER_COMPOSE=(docker-compose)
+else
+  echo "ERROR: Neither 'docker compose' (v2 plugin) nor 'docker-compose' (v1) is available." >&2
+  exit 2
+fi
+
 # Detect pre-existing container so we don't tear down something the user
 # was running independently (common case: developer already has the test
 # MySQL up from a prior session).
@@ -57,7 +68,7 @@ cleanup() {
     rm -rf "$TMPDIR"
   else
     echo "==> Cleaning up..."
-    (cd "$SCRIPT_DIR" && docker compose down -v >/dev/null 2>&1) || true
+    (cd "$SCRIPT_DIR" && "${DOCKER_COMPOSE[@]}" down -v >/dev/null 2>&1) || true
     rm -rf "$TMPDIR"
   fi
   exit $rc
@@ -75,8 +86,8 @@ fail() {
 if [ "$CONTAINER_WAS_RUNNING" = "true" ]; then
   echo "==> Reusing already-running myzql-ssl-test container"
 else
-  echo "==> Starting MySQL (docker compose)..."
-  (cd "$SCRIPT_DIR" && docker compose up -d --build) >/dev/null
+  echo "==> Starting MySQL (${DOCKER_COMPOSE[*]})..."
+  (cd "$SCRIPT_DIR" && "${DOCKER_COMPOSE[@]}" up -d --build) >/dev/null
 fi
 
 echo "==> Waiting for healthcheck..."
