@@ -25,8 +25,69 @@ const std = @import("std");
 const s3 = @import("s3");
 const object_store = @import("object_store.zig");
 const aws_creds = @import("aws_creds.zig");
+const clock = @import("clock.zig");
 
 const log = std.log.scoped(.s3_store);
+
+/// Full-request retry budget for mutating calls (PUT/DELETE). z3's
+/// internal retry only covers connection establishment; once a request
+/// is in flight, transport-layer failures (SendFailed, WriteFailed,
+/// ReceiveFailed, FlushFailed) are terminal. In practice these fire
+/// when a pooled keep-alive socket was silently half-closed - common
+/// across the ~10s gaps between parquet flushes - so the retry loop
+/// needs to wrap the whole lifecycle and reset the http pool between
+/// attempts (see `rebuildClient`), not just the TCP connect.
+const MAX_ATTEMPTS: u8 = 3;
+/// Initial backoff. A fast retry (100-200ms) just hits the same dead
+/// socket; something in the high hundreds gives NAT/idle-reaper time
+/// to actually drop it and lets a transient S3 blip clear.
+const INITIAL_BACKOFF_MS: u64 = 500;
+
+/// Classify z3 errors into "retry makes sense" vs "don't bother". The
+/// transport-layer bucket is what bites us on flaky keep-alive pools;
+/// connection-setup failures are also worth retrying (DNS blip, TLS
+/// handshake race). Auth, URI parsing, body-size contract violations
+/// never get better by retrying.
+fn isRetryableIoErr(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionFailed,
+        error.SendFailed,
+        error.WriteFailed,
+        error.ReceiveFailed,
+        error.FlushFailed,
+        error.ReadFailed,
+        => true,
+        else => false,
+    };
+}
+
+/// Build a `RequestOptions` that preserves the caller's custom headers
+/// but forces z3's own connection-establish retry off (`max_attempts=1`).
+/// Used on read-only paths where a 404 or an immediate connection error
+/// is the exact signal we want - retrying twice internally just pads
+/// the cold-start and hides what actually happened.
+fn singleAttemptOptions(base: s3.S3Client.RequestOptions) s3.S3Client.RequestOptions {
+    return .{
+        .custom_header = base.custom_header,
+        .max_attempts = 1,
+    };
+}
+
+/// Sleep with jittered exponential backoff. Jitter is a best-effort
+/// tweak to avoid thundering-herd across concurrent lanes; it's cheap
+/// to compute and doesn't need a real PRNG. Uses the posix nanosleep
+/// syscall directly (same pattern as pipeline.zig's ticker) to match
+/// the project's no-libc-sleep policy.
+fn backoffSleep(attempt: u8) void {
+    const base_ms: u64 = INITIAL_BACKOFF_MS << @intCast(@min(attempt, 5));
+    const jitter_ms: u64 = @intCast(@mod(clock.nanoTimestamp(), 50));
+    const total_ns: u64 = (base_ms + jitter_ms) * std.time.ns_per_ms;
+    const ts: std.posix.timespec = .{
+        .sec = @intCast(@divTrunc(total_ns, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(total_ns, std.time.ns_per_s)),
+    };
+    _ = std.posix.system.nanosleep(&ts, null);
+}
 
 /// Reuse the canonical Error set + HeadInfo from object_store so the
 /// dispatch through the tagged union in object_store.zig doesn't need
@@ -47,7 +108,9 @@ pub const Creds = aws_creds.Creds;
 
 pub const S3Store = struct {
     allocator: std.mem.Allocator,
-    /// Owned by the store; deinit'd on `S3Store.deinit`.
+    /// Owned by the store; deinit'd on `S3Store.deinit`. Mutable - the
+    /// retry path rebuilds it when a prior request left the http pool
+    /// holding a dead keep-alive socket (see `rebuildClient`).
     client: s3.S3Client,
     /// Borrowed; lifetime >= store. Caller owns these strings.
     bucket: []const u8,
@@ -56,6 +119,9 @@ pub const S3Store = struct {
     key_prefix: []const u8,
     /// Borrowed.
     creds: Creds,
+    /// Kept so we can reinitialise the client on retry without asking
+    /// callers to re-plumb it through. Borrowed (z3 stores a copy).
+    io: std.Io,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -81,11 +147,36 @@ pub const S3Store = struct {
             .bucket = bucket,
             .key_prefix = key_prefix,
             .creds = creds,
+            .io = io,
         };
     }
 
     pub fn deinit(self: *S3Store) void {
         self.client.deinit();
+    }
+
+    /// Drop the current S3 client (including its http keep-alive pool)
+    /// and spin up a fresh one. Used by the PUT/DELETE retry path when
+    /// the prior attempt failed with a transport-class error - those
+    /// almost always mean the pooled socket is half-closed, and z3
+    /// would otherwise hand us the same dead socket on the next call.
+    /// Failures here are logged and swallowed: the next request will
+    /// try the stale client, which at worst just repeats the original
+    /// failure without masking it.
+    fn rebuildClient(self: *S3Store) void {
+        self.client.deinit();
+        self.client = s3.S3Client.init(
+            self.allocator,
+            .{
+                .access_key_id = self.creds.access_key_id,
+                .secret_access_key = self.creds.secret_access_key,
+                .region = self.creds.region,
+            },
+            .{ .io = self.io },
+        ) catch |err| {
+            log.err("S3Client rebuild failed: {} - subsequent requests may reuse stale state", .{err});
+            return;
+        };
     }
 
     /// Compose the full S3 key from the store's prefix + caller-supplied
@@ -131,8 +222,13 @@ pub const S3Store = struct {
         defer allocator.free(composed);
 
         var headers_slot: [1]std.http.Header = undefined;
+        // GETs today only hit the state path (current.json /
+        // last_checkpoint.json) and cache entries. A cold-start 404 is
+        // a routine "file not there" signal, not a network fault, and
+        // the ~300ms z3 spends on two connection-retry attempts before
+        // giving up on real transport errors isn't worth it here.
         const opts: s3.S3Client.GetObjectOptions = .{
-            .request = self.requestOptionsWithToken(&headers_slot),
+            .request = singleAttemptOptions(self.requestOptionsWithToken(&headers_slot)),
         };
         var resp = self.client.getObject(self.bucket, composed, opts) catch |err| {
             log.err("S3 getObject '{s}' returned error: {}", .{ composed, err });
@@ -140,6 +236,11 @@ pub const S3Store = struct {
         };
         defer resp.deinit();
 
+        // 404 on GET is an expected signal on cold-start state reads
+        // (current.json / last_checkpoint.json on first run). Surface
+        // it as NotFound without the alarming error log that
+        // checkStatus emits.
+        if (resp.http_head.status == .not_found) return Error.NotFound;
         try checkStatus("get", composed, &resp);
 
         // resp.body is owned by resp.allocator; dupe into caller's allocator
@@ -153,7 +254,10 @@ pub const S3Store = struct {
         defer self.allocator.free(composed);
 
         var headers_slot: [1]std.http.Header = undefined;
-        const opts = self.requestOptionsWithToken(&headers_slot);
+        // Same rationale as `read`: a HEAD that 404s (cache TTL probe
+        // on a cold cache) is expected, and the retry latency would
+        // just push back the cold-start.
+        const opts = singleAttemptOptions(self.requestOptionsWithToken(&headers_slot));
         var resp = self.client.headObject(self.bucket, composed, opts) catch |err| {
             log.err("S3 headObject '{s}' returned error: {}", .{ composed, err });
             return Error.Io;
@@ -179,19 +283,35 @@ pub const S3Store = struct {
         const composed = try self.composeKey(self.allocator, key);
         defer self.allocator.free(composed);
 
-        var headers_slot: [1]std.http.Header = undefined;
-        const opts = self.requestOptionsWithToken(&headers_slot);
-        var resp = self.client.deleteObject(self.bucket, composed, opts) catch |err| {
-            log.err("S3 deleteObject '{s}' returned error: {}", .{ composed, err });
-            return Error.Io;
-        };
-        defer resp.deinit();
+        var attempt: u8 = 1;
+        while (true) : (attempt += 1) {
+            var headers_slot: [1]std.http.Header = undefined;
+            const opts = self.requestOptionsWithToken(&headers_slot);
 
-        // S3 returns 204 No Content on successful delete (and 204 also
-        // when the object didn't exist - DELETE is idempotent). Treat
-        // either as success; only non-2xx is an error.
-        if (statusOk(resp.http_head.status)) return;
-        try checkStatus("delete", composed, &resp);
+            if (self.client.deleteObject(self.bucket, composed, opts)) |resp_val| {
+                var resp = resp_val;
+                defer resp.deinit();
+                // S3 returns 204 No Content on successful delete (and
+                // 204 also when the object didn't exist - DELETE is
+                // idempotent). Treat either as success; only non-2xx
+                // is an error.
+                if (statusOk(resp.http_head.status)) return;
+                try checkStatus("delete", composed, &resp);
+                return;
+            } else |err| {
+                if (attempt < MAX_ATTEMPTS and isRetryableIoErr(err)) {
+                    log.warn(
+                        "S3 deleteObject '{s}' failed (attempt {d}/{d}): {} - rebuilding client and retrying",
+                        .{ composed, attempt, MAX_ATTEMPTS, err },
+                    );
+                    backoffSleep(attempt);
+                    self.rebuildClient();
+                    continue;
+                }
+                log.err("S3 deleteObject '{s}' returned error: {}", .{ composed, err });
+                return Error.Io;
+            }
+        }
     }
 };
 
@@ -240,23 +360,37 @@ pub const S3WriteHandle = struct {
             self.final_key = new_full;
         }
 
-        var headers_slot: [1]std.http.Header = undefined;
-        const opts: s3.S3Client.PutObjectOptions = .{
-            .request = self.store.requestOptionsWithToken(&headers_slot),
-        };
+        var attempt: u8 = 1;
+        while (true) : (attempt += 1) {
+            var headers_slot: [1]std.http.Header = undefined;
+            const opts: s3.S3Client.PutObjectOptions = .{
+                .request = self.store.requestOptionsWithToken(&headers_slot),
+            };
 
-        var resp = self.store.client.putObject(
-            self.store.bucket,
-            self.final_key,
-            self.buffer.items,
-            opts,
-        ) catch |err| {
-            log.err("S3 putObject '{s}' returned error: {}", .{ self.final_key, err });
-            return Error.Io;
-        };
-        defer resp.deinit();
-
-        try checkStatus("put", self.final_key, &resp);
+            if (self.store.client.putObject(
+                self.store.bucket,
+                self.final_key,
+                self.buffer.items,
+                opts,
+            )) |resp_val| {
+                var resp = resp_val;
+                defer resp.deinit();
+                try checkStatus("put", self.final_key, &resp);
+                return;
+            } else |err| {
+                if (attempt < MAX_ATTEMPTS and isRetryableIoErr(err)) {
+                    log.warn(
+                        "S3 putObject '{s}' failed (attempt {d}/{d}): {} - rebuilding client and retrying",
+                        .{ self.final_key, attempt, MAX_ATTEMPTS, err },
+                    );
+                    backoffSleep(attempt);
+                    self.store.rebuildClient();
+                    continue;
+                }
+                log.err("S3 putObject '{s}' returned error: {}", .{ self.final_key, err });
+                return Error.Io;
+            }
+        }
     }
 
     pub fn abort(self: *S3WriteHandle) void {
@@ -396,4 +530,20 @@ test "statusOk: 2xx is ok, others are not" {
     try testing.expect(!statusOk(.not_found));
     try testing.expect(!statusOk(.forbidden));
     try testing.expect(!statusOk(.internal_server_error));
+}
+
+test "isRetryableIoErr: transport-layer errors retry, contract errors do not" {
+    // These match the z3 error set a flaky keep-alive pool produces.
+    try testing.expect(isRetryableIoErr(error.ConnectionFailed));
+    try testing.expect(isRetryableIoErr(error.SendFailed));
+    try testing.expect(isRetryableIoErr(error.WriteFailed));
+    try testing.expect(isRetryableIoErr(error.ReceiveFailed));
+    try testing.expect(isRetryableIoErr(error.FlushFailed));
+    try testing.expect(isRetryableIoErr(error.ReadFailed));
+
+    // Contract / auth / programmer errors: retry never helps.
+    try testing.expect(!isRetryableIoErr(error.InvalidUri));
+    try testing.expect(!isRetryableIoErr(error.ConflictingCustomHeader));
+    try testing.expect(!isRetryableIoErr(error.BodyLengthMismatch));
+    try testing.expect(!isRetryableIoErr(error.OutOfMemory));
 }

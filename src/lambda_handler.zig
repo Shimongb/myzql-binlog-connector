@@ -146,14 +146,21 @@ fn handler(ctx: lambda.Context, event: []const u8) ![]const u8 {
     // 6. Compute soft_deadline_ms from Lambda's hard deadline.
     //    Lambda's request.deadline_ms is unix-epoch-ms when the
     //    container will be hard-killed. Subtract now() and the
-    //    safety buffer to get how long we'll drain.
+    //    safety buffer to get how long we'll drain. If the payload
+    //    set a smaller soft_deadline_ms explicitly, honor it (caps
+    //    the run shorter than Lambda would, useful for local repro
+    //    and for forcing an earlier clean shutdown during testing).
     const deadline_ms_i64: i64 = @intCast(ctx.request.deadline_ms);
     const remaining_ms = deadline_ms_i64 - clock.nowMs();
-    const drain_budget = remaining_ms - SAFETY_BUFFER_MS;
-    config.soft_deadline_ms = @max(drain_budget, MIN_SOFT_DEADLINE_MS);
+    const drain_budget = @max(remaining_ms - SAFETY_BUFFER_MS, MIN_SOFT_DEADLINE_MS);
+    const payload_deadline = config.soft_deadline_ms;
+    config.soft_deadline_ms = if (payload_deadline > 0)
+        @min(payload_deadline, drain_budget)
+    else
+        drain_budget;
     log.info(
-        "deadline math: remaining={d}ms safety={d}ms soft_deadline={d}ms",
-        .{ remaining_ms, SAFETY_BUFFER_MS, config.soft_deadline_ms },
+        "deadline math: remaining={d}ms safety={d}ms payload={d}ms soft_deadline={d}ms",
+        .{ remaining_ms, SAFETY_BUFFER_MS, payload_deadline, config.soft_deadline_ms },
     );
 
     // 7. Validate after merging is complete.

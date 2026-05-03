@@ -21,6 +21,7 @@ pub const clock = @import("clock.zig");
 pub const log_config = @import("log_config.zig");
 pub const s3_store = @import("s3_store.zig");
 pub const ssm_client = @import("ssm_client.zig");
+pub const row_json_serializer = @import("row_json_serializer.zig");
 
 test "root module" {
     // Placeholder test
@@ -42,4 +43,5 @@ comptime {
     _ = log_config;
     _ = s3_store;
     _ = ssm_client;
+    _ = row_json_serializer;
 }

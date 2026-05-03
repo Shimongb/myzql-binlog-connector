@@ -317,11 +317,19 @@ pub const RowJsonSerializer = struct {
                         try writer.writeByte(c);
                         i += 1;
                     } else {
-                        // Determine expected UTF-8 sequence length from start byte
+                        // Determine expected UTF-8 sequence length from start
+                        // byte. Upper bounds matter: 0xF5..=0xFF and 0xC0..=0xC1
+                        // are never valid lead bytes per RFC 3629, and
+                        // historically this branch let 0xF5..=0xFF fall through
+                        // the 4-byte test and get accepted as a 3-byte lead -
+                        // which then passed the continuation-bits check for
+                        // arbitrary MySQL binary bytes, producing parquet
+                        // strings that claim UTF-8 but aren't.
                         const seq_len: usize = if (c >= 0xF0 and c <= 0xF4) 4 //
-                            else if (c >= 0xE0) 3 //
-                            else if (c >= 0xC2) 2 //
-                            else 0; // 0x80-0xBF (continuation) or 0xC0-0xC1 (overlong)
+                            else if (c >= 0xE0 and c < 0xF0) 3 //
+                            else if (c >= 0xC2 and c < 0xE0) 2 //
+                            else 0; // 0x80-0xBF (continuation), 0xC0-0xC1
+                        // (overlong), or 0xF5-0xFF (out of range)
 
                         if (seq_len >= 2 and i + seq_len <= str.len) {
                             // Validate continuation bytes (must be 0x80-0xBF)
@@ -381,6 +389,40 @@ test "serialize string with escaping" {
     };
     const result = try s.serialize(&values);
     try std.testing.expectEqualStrings("{\"c0\":\"hello \\\"world\\\"\\n\"}", result);
+}
+
+test "serialize string: invalid UTF-8 leads get escaped, not passed through" {
+    // Regression: MySQL binary(16) columns arrive as .string with arbitrary
+    // bytes. A prior version's seq-len cascade accepted 0xF5-0xFF as 3-byte
+    // UTF-8 leads, which let parquet writers emit "UTF8" strings that weren't.
+    // DuckDB rejects those on read with "Invalid string encoding found in
+    // Parquet file ... not valid UTF8".
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    const values = [_]event_parser.RowValue{
+        .{ .string = &[_]u8{ 0xF9, 0x8D, 0xAD } },
+    };
+    const result = try s.serialize(&values);
+    // Each byte should be escaped as \u00xx individually; no raw byte
+    // should leak through into the output.
+    try std.testing.expectEqualStrings(
+        "{\"c0\":\"\\u00f9\\u008d\\u00ad\"}",
+        result,
+    );
+}
+
+test "serialize string: valid UTF-8 still passes through untouched" {
+    var s = RowJsonSerializer.init(std.testing.allocator, .auto_bool);
+    defer s.deinit();
+
+    // "héllo" - valid 2-byte UTF-8 (é = 0xC3 0xA9). Guards against the
+    // regression fix over-escaping and breaking real UTF-8.
+    const values = [_]event_parser.RowValue{
+        .{ .string = "h\xC3\xA9llo" },
+    };
+    const result = try s.serialize(&values);
+    try std.testing.expectEqualStrings("{\"c0\":\"h\xC3\xA9llo\"}", result);
 }
 
 test "serialize json passthrough" {
